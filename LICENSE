@@ -19,20 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-Third-party components
-----------------------
-
-- PySide6 (Qt for Python) — LGPL-3.0. Distributed as a separately installed
-  Python package and dynamically linked; see https://www.qt.io/licensing/.
-- NumPy — BSD-3-Clause.
-- Bundled fonts in app/assets/fonts/ (BIZ UDMincho, BIZ UDPGothic,
-  Shippori Mincho) — SIL Open Font License 1.1. The full license texts are
-  shipped alongside the fonts in app/assets/fonts/OFL-*.txt.
-
-U Draw is an independent reimplementation inspired by PhotoCraft 0.12.0
-(ArtCraft, MIT / Apache-2.0). It contains no PhotoCraft source code. The name
-"PhotoCraft" and its trademarks belong to ArtCraft; this project is not
-affiliated with or endorsed by ArtCraft.

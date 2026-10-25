@@ -211,3 +211,5 @@ U Draw 衍生于 **[PhotoCraft 0.12.0](https://getartcraft.com/apps/photocraft)*
 [MIT](LICENSE) © 2026 宇
 
 你可以自由使用、修改、分发、商用，只需保留版权声明与许可声明。
+
+PySide6（LGPL-3.0）、NumPy（BSD-3-Clause）与内置 OFL 字体的授权细节见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
