@@ -84,7 +84,7 @@ U Draw 是一个**专注绘画本身**的桌面绘图软件：没有修图、调
 
 ### 直接用（不需要 Python）
 
-从 [Releases](../../releases) 下载 `U Draw Setup <版本>.exe`，双击安装。默认装到 `%LOCALAPPDATA%\Programs\U Draw`，**不需要管理员权限**。
+到 [Releases](../../releases/latest) 下载 `U-Draw-Setup-<版本>.exe`，双击安装。默认装到 `%LOCALAPPDATA%\Programs\U Draw`，**不需要管理员权限**。
 
 静默安装：
 
