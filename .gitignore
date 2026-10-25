@@ -1,0 +1,36 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+develop-eggs/
+.eggs/
+*.egg-info/
+.venv/
+venv/
+env/
+ENV/
+
+# ---- 打包产物 ----
+*.spec
+_internal/
+U Draw.exe
+U Draw Setup*.exe
+
+# ---- 测试与运行日志 ----
+log_*.txt
+*.log
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 用户数据 ----
+*.pcdraw

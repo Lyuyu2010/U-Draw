@@ -1,0 +1,9 @@
+# 运行源码所需
+PySide6>=6.6
+numpy>=1.24
+
+# 仅打包 exe / 安装包时需要
+# pyinstaller>=6.0
+
+# 仅 PSD 导出的交叉验证脚本（_psd_test.py）需要，非运行依赖
+# psd-tools>=1.9

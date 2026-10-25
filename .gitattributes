@@ -1,0 +1,13 @@
+# 统一用 LF 存进仓库，检出时按平台转换
+* text=auto eol=lf
+
+*.py   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.json text eol=lf
+
+*.png  binary
+*.jpg  binary
+*.ico  binary
+*.ttf  binary
+*.pcdraw binary
