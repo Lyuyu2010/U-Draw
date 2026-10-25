@@ -914,6 +914,10 @@ class Canvas(QWidget):
                 return
             self._tf_mode = mode
             self._tf_handle = idx
+            if mode == "move":
+                self.setCursor(Qt.ClosedHandCursor)   # 抓着走：抓手，松手回到十字箭头
+                self._cursor_key = Qt.ClosedHandCursor
+            self._tf_pre = self._tf.state()            # 这一步调整之前的样子
             self._tf_start = self.screen_to_doc(pos)
             self._tf_saved = (QPointF(self._tf.center), self._tf.w, self._tf.h, self._tf.angle)
             return
@@ -1087,6 +1091,9 @@ class Canvas(QWidget):
         # 会一直留在画布边缘（用户反馈的「光标卡在边缘」）。
         self._inside = self.rect().contains(QPoint(int(pos.x()), int(pos.y())))
 
+        if self._tf is not None:
+            self._tf_apply_cursor(pos)      # 框内/边/角/框外 各有各的光标
+
         if self._panning:
             self.ox = self._pan_origin[0] + (pos.x() - self._pan_from.x())
             self.oy = self._pan_origin[1] + (pos.y() - self._pan_from.y())
@@ -1232,6 +1239,11 @@ class Canvas(QWidget):
             return
 
         if self._tf is not None:
+            pre = getattr(self, "_tf_pre", None)
+            if pre is not None and self._tf_mode is not None:
+                if not self._tf_same(pre, self._tf.state()):
+                    self._tf.steps.append(pre)     # 记一步，Ctrl+Z 可以退回来
+            self._tf_pre = None
             self._tf_mode = None
             self._tf_handle = -1
             return
@@ -1307,6 +1319,7 @@ class Canvas(QWidget):
         self._tf = TransformOp(self.doc, layer)
         self._tf.render()
         self.doc.recompose()
+        self._cursor_key = None
         self.setCursor(Qt.SizeAllCursor)
         self.update()
         self.transformChanged.emit(True)
@@ -1325,9 +1338,20 @@ class Canvas(QWidget):
         bw, _ = self.tf_base_size()
         return 100.0 * (self._tf.w / bw if self._tf is not None else 1.0)
 
+    def _tf_mark_step(self):
+        """滑杆类改动：0.8 秒内的连续变化只算一步，免得撤回要按几十次。"""
+        tf = self._tf
+        if tf is None:
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_tf_step_t", 0.0) > 0.8:
+            tf.steps.append(tf.state())
+        self._tf_step_t = now
+
     def tf_set_angle(self, deg: float):
         if self._tf is None:
             return
+        self._tf_mark_step()
         self._tf.angle = float(deg)
         self._tf.render()
         self.doc.recompose()
@@ -1336,6 +1360,7 @@ class Canvas(QWidget):
     def tf_set_scale(self, pct: float):
         if self._tf is None:
             return
+        self._tf_mark_step()
         bw, bh = self.tf_base_size()
         k = max(0.02, float(pct) / 100.0)
         self._tf.w = bw * k
@@ -1344,9 +1369,31 @@ class Canvas(QWidget):
         self.doc.recompose()
         self.update()
 
+    @staticmethod
+    def _tf_same(a, b) -> bool:
+        return (abs(a[0].x() - b[0].x()) < 0.01 and abs(a[0].y() - b[0].y()) < 0.01
+                and abs(a[1] - b[1]) < 0.01 and abs(a[2] - b[2]) < 0.01
+                and abs(a[3] - b[3]) < 0.01 and a[4] == b[4] and a[5] == b[5])
+
+    def tf_step_back(self) -> bool:
+        """自由变换里退一步：回到上一次调整之前的样子（不是整件事取消）。
+
+        返回 False 表示已经退到头了，调用方可以去取消整个变换。
+        """
+        tf = self._tf
+        if tf is None or not tf.steps:
+            return False
+        tf.set_state(tf.steps.pop())
+        tf.render()
+        self.doc.recompose()
+        self.update()
+        self.transformChanged.emit(True)      # 选项栏滑杆跟着回去
+        return True
+
     def tf_flip(self, horizontal: bool):
         if self._tf is None:
             return
+        self._tf.steps.append(self._tf.state())
         if horizontal:
             self._tf.flip_h = not self._tf.flip_h
         else:
@@ -1367,6 +1414,8 @@ class Canvas(QWidget):
         self.update()
         self.historyChanged.emit()
         self.docChanged.emit()
+        self._cursor_key = None
+        self._cursor_shape = None
         self.setCursor(Qt.BlankCursor if self.tool in ("brush", "eraser", "smudge")
                        else Qt.CrossCursor)
         self.transformChanged.emit(False)
@@ -1383,7 +1432,84 @@ class Canvas(QWidget):
         op.layer.touch()
         self.doc.recompose()
         self.update()
+        self._cursor_key = None
+        self._cursor_shape = None
+        self.setCursor(Qt.CrossCursor)
         self.transformChanged.emit(False)
+
+    def _rotate_cursor(self):
+        """自由变换「框外旋转」用的圆形箭头光标（Qt 没有内置的旋转光标）。"""
+        cur = getattr(self, "_rot_cur", None)
+        if cur is not None:
+            return cur
+        pm = QPixmap(30, 30)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        rect = QRectF(6.0, 6.0, 18.0, 18.0)
+        # 先描一圈深色，再叠白色细弧：浅底深底都看得清
+        p.setPen(QPen(QColor(0, 0, 0, 170), 4.6, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(rect, 60 * 16, 250 * 16)
+        p.setPen(QPen(QColor(255, 255, 255, 240), 2.4, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(rect, 60 * 16, 250 * 16)
+        # 弧的末端加个箭头（在 310° 附近，指向上方偏左）
+        p.setBrush(QColor(255, 255, 255, 240))
+        p.setPen(QPen(QColor(0, 0, 0, 170), 1.2))
+        p.drawPolygon([QPointF(20.4, 21.4), QPointF(25.0, 20.2), QPointF(21.6, 16.6)])
+        p.end()
+        cur = QCursor(pm, 15, 15)
+        self._rot_cur = cur
+        return cur
+
+    def _tf_cursor(self, pos: QPointF):
+        """自由变换模式下按落点给光标：
+        框内 = 移动（十字箭头）、边 = 单向缩放、角 = 斜向缩放、框外一圈 = 旋转。
+
+        缩放光标按「手柄相对中心的方向」在**屏幕坐标**里判断 —— 这样变换框转过之后
+        光标方向仍然是对的（不能直接按手柄序号给，转过 90° 就全反了）。
+        """
+        tf = self._tf
+        if tf is None:
+            return None
+        mode, idx = self._tf_hit(pos)
+        if mode == "move":
+            return Qt.SizeAllCursor
+        if mode == "rotate":
+            return self._rotate_cursor()
+        if mode == "scale":
+            c = self.doc_to_screen(tf.center)
+            hp = self.doc_to_screen(tf.handles()[idx])
+            ang = math.degrees(math.atan2(hp.y() - c.y(), hp.x() - c.x())) % 180.0
+            if ang < 22.5 or ang >= 157.5:
+                return Qt.SizeHorCursor
+            if ang < 67.5:
+                return Qt.SizeFDiagCursor
+            if ang < 112.5:
+                return Qt.SizeVerCursor
+            return Qt.SizeBDiagCursor
+        return Qt.CrossCursor
+
+    @staticmethod
+    def _cur_key(cur):
+        """把 QCursor / Qt.CursorShape 统一成可比较的键。
+
+        PySide6 的 Qt.CursorShape 是普通 Enum：既不是 int 子类，也不能 int() 转换，
+        只能取 .value。这里统一处理，别再踩这个坑。
+        """
+        if isinstance(cur, QCursor):
+            return "rotate"
+        return getattr(cur, "value", str(cur))
+
+    def _tf_apply_cursor(self, pos: QPointF):
+        """只在光标形状真的变了才 setCursor（每个 move 都设一遍会拖慢）。"""
+        cur = self._tf_cursor(pos)
+        if cur is None:
+            return
+        key = self._cur_key(cur)
+        if getattr(self, "_cursor_key", None) != key:
+            self._cursor_key = key
+            self._cursor_shape = key
+            self.setCursor(cur)
 
     def _tf_hit(self, pos: QPointF):
         """返回 ('scale', idx) / ('move', -1) / ('rotate', -1) / (None, -1)。"""
@@ -1583,14 +1709,17 @@ class Canvas(QWidget):
         enterEvent / mouseMoveEvent，光标就会一直停在「上一个工作区」的样子 ——
         用户反馈的「回到画布没切回画笔光标」就是这个。
         """
+        if self._tf is not None:
+            return                  # 变换模式下由 _tf_apply_cursor 按落点给光标
         if self._panning or self._sym_drag:
             want = Qt.ClosedHandCursor
         elif self._sym_hot:
             want = Qt.OpenHandCursor
         else:
             want = self._tool_cursor()
-        if getattr(self, "_cursor_shape", None) != want:
-            self._cursor_shape = want
+        key = self._cur_key(want)
+        if getattr(self, "_cursor_shape", None) != key:
+            self._cursor_shape = key
             self.setCursor(want)
 
     def _check_pointer_over(self):

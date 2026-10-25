@@ -10,7 +10,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)](https://www.python.org/)
 [![PySide6](https://img.shields.io/badge/PySide6-6.6%2B-41CD52.svg)](https://pypi.org/project/PySide6/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011-0078D4.svg)](#系统要求)
-[![Version](https://img.shields.io/badge/version-2.15.35-informational.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.15.39-informational.svg)](#)
 
 [功能](#功能) · [快速开始](#快速开始) · [快捷键](#快捷键速查) · [项目结构](#项目结构) · [打包](#从源码打包) · [致谢](#致谢与血缘)
 
@@ -89,7 +89,7 @@ U Draw 是一个**专注绘画本身**的桌面绘图软件：没有修图、调
 静默安装：
 
 ```bash
-"U Draw Setup 2.15.35.exe" --silent --dir="D:\Apps\U Draw" --no-desktop --no-startmenu
+"U Draw Setup 2.15.39.exe" --silent --dir="D:\Apps\U Draw" --no-desktop --no-startmenu
 ```
 
 ### 跑源码

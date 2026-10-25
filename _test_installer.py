@@ -13,7 +13,7 @@ import winreg
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-SETUP = os.path.join(ROOT, "U Draw Setup 2.15.35.exe")
+SETUP = os.path.join(ROOT, "U Draw Setup 2.15.39.exe")
 REG = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\UDraw"
 
 ok = True
@@ -67,7 +67,7 @@ check("安装目录是目录版（U Draw.exe + _internal）",
 check("_internal 里有解释器",
       os.path.isfile(os.path.join(dest, "_internal", "python313.dll")))
 check("注册表有 DisplayName", reg_value("DisplayName") == "U Draw", str(reg_value("DisplayName")))
-check("注册表版本正确", reg_value("DisplayVersion") == "2.15.35", str(reg_value("DisplayVersion")))
+check("注册表版本正确", reg_value("DisplayVersion") == "2.15.39", str(reg_value("DisplayVersion")))
 check("卸载命令指向主程序 --uninstall",
       (reg_value("UninstallString") or "").lower().endswith('u draw.exe" --uninstall'),
       str(reg_value("UninstallString")))

@@ -58,7 +58,7 @@ else:                        # 非 Windows：占位，标题栏停靠功能自�
 APP_NAME = "U Draw"
 DEFAULT_W, DEFAULT_H = 1920, 1080
 # 必须和 app/version_info.txt 里的 FileVersion 保持一致（标题栏 / 关于窗口都读这里）
-APP_VERSION = "2.15.35"
+APP_VERSION = "2.15.39"
 
 # (组键, 名称, 快捷键, 图标, 子工具列表)  —— 选区三个工具合并成一个按钮
 TOOL_GROUPS = [
@@ -1071,6 +1071,7 @@ class MainWindow(QWidget):
                 b.setFixedHeight(24)
                 b.clicked.connect(lambda _=False, h=horiz: self.canvas.tf_flip(h))
                 self.options_layout.addWidget(b)
+
 
             self.options_layout.addStretch(1)
             tip = QLabel("框内拖动移动 · 拖角缩放 · 框外旋转 · 双击/Enter 应用 · Esc 取消")
@@ -2543,8 +2544,12 @@ class MainWindow(QWidget):
 
     def undo(self):
         if self.canvas.has_transform():
-            self.canvas.cancel_transform()
-            self.hint.setText("已撤回到变换前（自由变换取消）")
+            # 自由变换里：一次退一步（回到上一次调整之前），退到头了才取消整个变换
+            if self.canvas.tf_step_back():
+                self.hint.setText("自由变换：退回上一步（继续按可一路退，退完再按才是取消变换）")
+            else:
+                self.canvas.cancel_transform()
+                self.hint.setText("已撤回到变换前（自由变换取消）")
             return
         if self.doc.undo():
             self.layers_panel.refresh()

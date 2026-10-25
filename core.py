@@ -1038,7 +1038,14 @@ class Stroke:
         # 会叠出更深的颜色 —— 就是用户说的「拐弯颜色重叠」。
         # 这类笔在**同一笔内**改成「取最大浓度」，线条交叉处不再变深。
         b = self.brush
-        if (b.flow >= 0.98 and b.opacity >= 0.98 and not b.build_up
+        # 但「取最大浓度」是按通道取最大 —— 只有当整笔颜色不变时才成立。
+        # 彩虹笔（kind=rainbow）和带色相/饱和度/明度抖动的笔，每颗笔点颜色都不同，
+        # 取通道最大会把不同色相混成发白的怪颜色（连续彩虹笔实测就是这样）。
+        color_fixed = (b.kind != "rainbow"
+                       and b.hue_jitter < 0.001
+                       and b.sat_jitter < 0.001
+                       and b.val_jitter < 0.001)
+        if (color_fixed and b.flow >= 0.98 and b.opacity >= 0.98 and not b.build_up
                 and (b.kind in special_tips.KINDS or b.kind in STAMP_KINDS)):
             p.setCompositionMode(QPainter.CompositionMode_Lighten)
         p.translate(-self.buf.rect.left(), -self.buf.rect.top())
@@ -3388,12 +3395,30 @@ class TransformOp:
         self.before = layer.image.copy()
         self.off_before = layer.off
         self.pos_before = QPoint(layer.off_pos)
-        self.center = QPointF(box.center())
+        # 中心用 QRectF 的浮点中心，不要用 QRect.center()：
+        # 后者是整数取整（1920 宽会算成 959 而不是 960），
+        # 一进自由变换内容就被整体挪了 1px —— 重置也回不到原样。
+        self.center = QPointF(self.src_rect.center())
         self.w = float(box.width())
         self.h = float(box.height())
         self.angle = 0.0
         self.flip_h = False
         self.flip_v = False
+        # 进变换时的原始姿态（也是步进撤回的栈底）
+        self.home = (QPointF(self.center), self.w, self.h, 0.0, False, False)
+        # 每一步调整之前的姿态：自由变换里按 Ctrl+Z 一次退一步，而不是整件事取消
+        self.steps = []
+
+    # -- 状态快照（步进撤回用）--
+    def state(self):
+        return (QPointF(self.center), self.w, self.h, self.angle,
+                self.flip_h, self.flip_v)
+
+    def set_state(self, st):
+        self.center = QPointF(st[0])
+        self.w, self.h = st[1], st[2]
+        self.angle = st[3]
+        self.flip_h, self.flip_v = st[4], st[5]
 
     # -- 几何 --
     def transform(self) -> QTransform:
@@ -3429,10 +3454,18 @@ class TransformOp:
                 p.setClipPath(self.full.subtracted(self.sel))
                 p.drawImage(self.src_pos, self.base)
                 p.restore()
-            p.setRenderHint(QPainter.SmoothPixmapTransform, True)
-            p.setRenderHint(QPainter.Antialiasing, True)
-            p.setTransform(self.transform())
-            p.drawImage(self.src_rect.topLeft(), self.content)
+            t = self.transform()
+            # 原位原尺寸（刚进变换 / 点过「重置」）：直接 1:1 贴回去。
+            # 走平滑采样的话，边缘会被重采样磨掉一点 —— 重置完就不是「和没变换过一样」了。
+            m = (t.m11(), t.m12(), t.m21(), t.m22(), t.dx(), t.dy())
+            if (abs(m[0] - 1) < 1e-6 and abs(m[1]) < 1e-6 and abs(m[2]) < 1e-6
+                    and abs(m[3] - 1) < 1e-6 and abs(m[4]) < 0.01 and abs(m[5]) < 0.01):
+                p.drawImage(self.src_rect.topLeft(), self.content)
+            else:
+                p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+                p.setRenderHint(QPainter.Antialiasing, True)
+                p.setTransform(t)
+                p.drawImage(self.src_rect.topLeft(), self.content)
             p.end()
             self.layer.touch()
             self.layer.has_content = True
