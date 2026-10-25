@@ -561,10 +561,16 @@ class Canvas(QWidget):
         p.setBrush(Qt.NoBrush)
         p.drawLine(QPointF(c.x() - 9, c.y()), QPointF(c.x() + 9, c.y()))
         p.drawLine(QPointF(c.x(), c.y() - 9), QPointF(c.x(), c.y() + 9))
-        # 轴心画成实心圆点：它是可以按住拖的，空心的看不出「能抓」
-        p.setPen(QPen(QColor(255, 255, 255, 235), 1.2))
-        p.setBrush(QColor(84, 168, 255, 255 if self._sym_hot or self._sym_drag else 215))
-        p.drawEllipse(c, 5.0, 5.0)
+        if sym.get("locked", False):
+            # 固定状态：画个小点表示「轴心在这儿」，不做成能抓的样子
+            p.setPen(QPen(QColor(84, 168, 255, 235), 1.0))
+            p.setBrush(QColor(84, 168, 255, 200))
+            p.drawEllipse(c, 2.6, 2.6)
+        else:
+            # 轴心画成实心圆点：它是可以按住拖的，空心的看不出「能抓」
+            p.setPen(QPen(QColor(255, 255, 255, 235), 1.2))
+            p.setBrush(QColor(84, 168, 255, 255 if self._sym_hot or self._sym_drag else 215))
+            p.drawEllipse(c, 5.0, 5.0)
         p.restore()
 
     # ------------------------------------------------------------ 对称轴心拖动
@@ -572,6 +578,10 @@ class Canvas(QWidget):
         """光标是否落在对称轴心手柄上（半径 11 屏幕像素）。"""
         sym = self.symmetry
         if sym.get("mode", "off") == "off":
+            return False
+        # 面板上点了「固定」：轴心锁死，不该再出现抓手光标和可拖热区
+        # （用户反馈：已经固定了还显示抓手，看着像能拖）
+        if sym.get("locked", False):
             return False
         if self.tool not in ("brush", "eraser", "smudge"):
             return False
@@ -1713,7 +1723,8 @@ class Canvas(QWidget):
             return                  # 变换模式下由 _tf_apply_cursor 按落点给光标
         if self._panning or self._sym_drag:
             want = Qt.ClosedHandCursor
-        elif self._sym_hot:
+        elif self._sym_hot and not self.symmetry.get("locked", False):
+            # 固定状态下哪怕 _sym_hot 还是旧的 True，也不能给手形光标
             want = Qt.OpenHandCursor
         else:
             want = self._tool_cursor()

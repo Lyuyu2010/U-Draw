@@ -58,7 +58,7 @@ else:                        # 非 Windows：占位，标题栏停靠功能自�
 APP_NAME = "U Draw"
 DEFAULT_W, DEFAULT_H = 1920, 1080
 # 必须和 app/version_info.txt 里的 FileVersion 保持一致（标题栏 / 关于窗口都读这里）
-APP_VERSION = "2.15.39"
+APP_VERSION = "2.15.41"
 
 # (组键, 名称, 快捷键, 图标, 子工具列表)  —— 选区三个工具合并成一个按钮
 TOOL_GROUPS = [
@@ -1581,7 +1581,8 @@ class MainWindow(QWidget):
                 self._syncing_brush_sliders = False
             self.hint.setText(f"喷点笔尖不能大于范围（{int(round(b.spread))} px）")
         b.size = v
-        self.brush_panel.sync_size(v)
+        if b is self.brush:
+            self.brush_panel.sync_size(v)
         # 范围还是「跟随大小」时，顶部范围数字跟着笔尖一起变。
         if b.kind in SPRAY_KINDS and b.spread <= 0.001:
             slider = getattr(self, "_range_slider", None)
@@ -1592,8 +1593,12 @@ class MainWindow(QWidget):
         self.canvas.refresh_brush_cursor()
 
     def _set_density(self, v):
-        self.brush_panel.set_field("density", v / 100.0)
-        if self._tool_brush().kind in SPRAY_KINDS:
+        b = self._tool_brush()
+        if b is self.brush:
+            self.brush_panel.set_field("density", v / 100.0)
+        else:
+            b.density = max(0.0, min(1.0, v / 100.0))
+        if b.kind in SPRAY_KINDS:
             self.canvas.show_range_preview()
 
     def _set_spread(self, v):
@@ -1615,14 +1620,29 @@ class MainWindow(QWidget):
         self.canvas.show_range_preview()
         self.canvas.refresh_brush_cursor()
 
+    def _set_brush_field(self, attr: str, v: float):
+        """选项栏的滑杆：改「当前工具那支笔」。
+
+        画笔走 BrushPanel（那边要同步滑杆、预设、试笔条）；
+        橡皮 / 涂抹直接写自己那支笔 —— 以前这里一律调 brush_panel，
+        结果在橡皮上拖不透明度 / 流量 / 硬度，改的是画笔，橡皮一点反应都没有。
+        """
+        val = max(0.0, min(1.0, v / 100.0))
+        b = self._tool_brush()
+        if b is self.brush:
+            self.brush_panel.set_param(attr, val)
+        else:
+            setattr(b, attr, val)
+            self.canvas.refresh_brush_cursor()
+
     def _set_opacity(self, v):
-        self.brush_panel.set_param("opacity", v / 100.0)
+        self._set_brush_field("opacity", v)
 
     def _set_flow(self, v):
-        self.brush_panel.set_param("flow", v / 100.0)
+        self._set_brush_field("flow", v)
 
     def _set_hardness(self, v):
-        self.brush_panel.set_param("hardness", v / 100.0)
+        self._set_brush_field("hardness", v)
 
     def _set_move_auto(self, on):
         self.canvas.move_auto_select = bool(on)
@@ -2896,11 +2916,14 @@ class MainWindow(QWidget):
         return isinstance(w, (QLineEdit, QSpinBox, QTextEdit, QPlainTextEdit))
 
     def _nudge_size(self, up: bool):
-        size = self.brush.size * (1.18 if up else 0.85)
+        # 改的是「当前工具那支笔」：橡皮 / 涂抹 各有自己的笔径，
+        # 以前这里写死 self.brush，所以在橡皮上按 [ ] 改的其实是画笔。
+        b = self._tool_brush()
+        size = b.size * (1.18 if up else 0.85)
         size = max(1.0, min(400.0, size))
         # 喷点类的笔尖不能超过范围；键盘调大时也守这个规则。
-        if self.brush.kind in SPRAY_KINDS and self.brush.spread > 0.001:
-            size = min(size, self.brush.spread)
+        if b.kind in SPRAY_KINDS and b.spread > 0.001:
+            size = min(size, b.spread)
         self._set_size(size)
         self._build_options()
         self.canvas.update()
