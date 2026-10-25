@@ -542,6 +542,8 @@ def load_library():
         c.origin = b.name
         for field, value in (edits.get(b.name) or {}).items():
             if field in Brush.FIELDS and field not in ("name", "group"):
+                if field == "kind" and getattr(c, "kind", None) == "rainbow":
+                    continue      # 同上：彩虹笔不允许被改成别的笔型
                 setattr(c, field, value)
         presets.append(c)
     names = {b.name for b in presets}
@@ -620,6 +622,10 @@ def _edits_of(presets):
         diff = {}
         for f in Brush.FIELDS:
             if f in ("name", "group"):
+                continue
+            if f == "kind" and getattr(default, "kind", None) == "rainbow":
+                # 彩虹笔的「笔型 = 彩虹」就是它的本质：被改成别的笔型后它不再变色，
+                # 那就不是彩虹笔了。这种情况一律当作误改，不写进存档。
                 continue
             if getattr(b, f) != getattr(default, f):
                 diff[f] = getattr(b, f)

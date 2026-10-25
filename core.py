@@ -319,7 +319,9 @@ class Brush:
             # 轻压段再垫一层底（0.18 + 0.82·pr）：满压时系数仍是 1.0，
             # 只是把「刚接触」那一档从 5% 的墨抬到 15% 左右 —— 屏幕上才看得见。
             pr = 0.18 + 0.82 * (_press(pressure, self.press_curve) ** 0.9)
-            a *= max(0.12, pr)
+            # 地板 0.12 → 0.15：笔点间距修正成真正的均匀之后，细笔的墨量
+            # 比之前（间距算大、笔点偏密）少了约一成，轻压会偏淡，这里补回来。
+            a *= max(0.15, pr)
         s = self.spacing if cover is None else cover
         if 0.01 < s < 1.0:
             a = 1.0 - (1.0 - _clamp(a)) ** s
@@ -976,7 +978,13 @@ class Stroke:
             target = 0.008 + 0.058 * soft * soft
         else:
             target = 0.008
-        self._dab_step = max(1, min(12, int(math.ceil(target / a0))))
+        # 隔点也不能隔太狠：细笔上「隔 5 个点」等于每 2px 才一颗，
+        # 柔边叠不起来就成了一串珠子（用户反馈的「一点一点」）。
+        # 这里把有效间距压在笔径的 12% 以内 —— 大笔刷照旧可以隔得很开，
+        # 细笔自动收紧，笔迹才是连续的。
+        sp_px = max(0.4, brush.stamp_spacing(1.0))
+        max_step = max(1, int((0.12 * max(1.0, brush.size)) / sp_px))
+        self._dab_step = max(1, min(12, int(math.ceil(target / a0)), max_step))
         self._dab_i = 0
         self._anchor = None         # 中点样条的起点
         self._stab = None           # 抖动修正的绳头
@@ -1341,7 +1349,21 @@ class Stroke:
         a = self._anchor if self._anchor is not None else p0
         m = QPointF((p0.x() + p1.x()) / 2.0, (p0.y() + p1.y()) / 2.0)
         pr0 = self.last_p
-        approx = _dist(a, m) + _dist(p0, p1) * 0.5
+        # 二次贝塞尔的参数 u 和**弧长**不成正比：输入间距不均（手快时一跳几十像素）
+        # 时，按 u 平均取点会让笔点一头密一头疏 —— 笔迹上就是一串明暗相间的珠子
+        # （用户反馈的「细笔 + 低硬度 → 一点一点」）。
+        # 这里先把曲线细分成 12 段算累计弧长，再按弧长反查 u，间距才是真的均匀。
+        sub = 12
+        cum = [0.0] * (sub + 1)
+        px, py = a.x(), a.y()
+        for i in range(1, sub + 1):
+            uu = i / sub
+            iu = 1.0 - uu
+            bx = iu * iu * a.x() + 2 * uu * iu * p0.x() + uu * uu * m.x()
+            by = iu * iu * a.y() + 2 * uu * iu * p0.y() + uu * uu * m.y()
+            cum[i] = cum[i - 1] + math.hypot(bx - px, by - py)
+            px, py = bx, by
+        approx = cum[sub]
         step = self.brush.stamp_spacing(pr0)
         out = []
         # 关键：从上一段剩下的余量接着走，而不是「每小段至少画 2 个笔点」——
@@ -1349,7 +1371,19 @@ class Stroke:
         dist = self._carry
         guard = 0
         while dist <= approx and guard < 4000:
-            u = dist / approx if approx > 1e-6 else 1.0
+            # 累计弧长 → 参数 u（二分 + 段内线性插值）
+            if dist <= 0.0:
+                u = 0.0
+            else:
+                lo, hi = 0, sub
+                while lo < hi - 1:
+                    mid = (lo + hi) // 2
+                    if cum[mid] <= dist:
+                        lo = mid
+                    else:
+                        hi = mid
+                span = cum[hi] - cum[lo]
+                u = (lo + (dist - cum[lo]) / span) / sub if span > 1e-9 else lo / sub
             iu = 1.0 - u
             x = iu * iu * a.x() + 2 * u * iu * p0.x() + u * u * m.x()
             y = iu * iu * a.y() + 2 * u * iu * p0.y() + u * u * m.y()
@@ -1521,7 +1555,14 @@ class Stroke:
         （以前是给每个笔尖贴随机颗粒，间距一小就叠成一团糊，看着像没效果。）
         """
         b = self.brush
-        tile = grain_tile(b.grain, b.grain_scale, 0)
+        # 笔越细，颗粒越细、越弱：
+        # 10px 的铅笔配 2px 纸纹，一条线只有四五格，纸纹的空隙把笔迹切成
+        # 一粒一粒（用户反馈的「一点一点」）。细笔只留一点点纸感，粗笔保持原样。
+        size = max(1.0, b.diameter(1.0))
+        k = _clamp((size - 8.0) / 24.0)          # 8px 及以下 → 0，32px 以上 → 1
+        level = _clamp(b.grain * (0.30 + 0.70 * k))
+        gscale = max(1.0, b.grain_scale * (0.45 + 0.55 * k))
+        tile = grain_tile(level, gscale, 0)
         ts = tile.width()
         ox, oy = self._grain_off
         q = QPainter(patch)
@@ -2817,7 +2858,14 @@ class Document:
         （以前是给每个笔尖贴随机颗粒，间距一小就叠成一团糊，看着像没效果。）
         """
         b = self.brush
-        tile = grain_tile(b.grain, b.grain_scale, 0)
+        # 笔越细，颗粒越细、越弱：
+        # 10px 的铅笔配 2px 纸纹，一条线只有四五格，纸纹的空隙把笔迹切成
+        # 一粒一粒（用户反馈的「一点一点」）。细笔只留一点点纸感，粗笔保持原样。
+        size = max(1.0, b.diameter(1.0))
+        k = _clamp((size - 8.0) / 24.0)          # 8px 及以下 → 0，32px 以上 → 1
+        level = _clamp(b.grain * (0.30 + 0.70 * k))
+        gscale = max(1.0, b.grain_scale * (0.45 + 0.55 * k))
+        tile = grain_tile(level, gscale, 0)
         ts = tile.width()
         ox, oy = self._grain_off
         q = QPainter(patch)

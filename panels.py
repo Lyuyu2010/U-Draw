@@ -2031,6 +2031,7 @@ class BrushPanel(Section):
             blocked = self.kind_combo.blockSignals(True)
             try:
                 self.kind_combo.setCurrentIndex(self.kind_combo.findData(b.kind))
+                self._synced_kind = b.kind      # 下拉框现在显示的就是这个笔型
             finally:
                 self.kind_combo.blockSignals(blocked)
         finally:
@@ -2043,9 +2044,15 @@ class BrushPanel(Section):
             return
         b = self.brush
         kind = self.kind_combo.currentData()
-        kind_changed = kind is not None and kind != b.kind
-        if kind is not None:
+        # 只有「下拉框真的被换过」才改笔型。
+        # 以前这里无条件 b.kind = 下拉框的值：下拉框一旦和当前笔不同步（切换工具、
+        # 刚绑定时），随便拖一下滑杆就会把笔型悄悄改掉 —— 连续彩虹就是这么变成
+        # 「圆珠笔」、画出来没有颜色的。
+        synced = getattr(self, "_synced_kind", None)
+        kind_changed = kind is not None and synced is not None and kind != synced
+        if kind_changed:
             b.kind = kind
+        self._synced_kind = b.kind
         for attr, w in self.sliders.items():
             v = w.slider.value()
             if attr == "scatter_count":

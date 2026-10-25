@@ -58,7 +58,7 @@ else:                        # 非 Windows：占位，标题栏停靠功能自�
 APP_NAME = "U Draw"
 DEFAULT_W, DEFAULT_H = 1920, 1080
 # 必须和 app/version_info.txt 里的 FileVersion 保持一致（标题栏 / 关于窗口都读这里）
-APP_VERSION = "2.15.41"
+APP_VERSION = "2.15.42"
 
 # (组键, 名称, 快捷键, 图标, 子工具列表)  —— 选区三个工具合并成一个按钮
 TOOL_GROUPS = [
