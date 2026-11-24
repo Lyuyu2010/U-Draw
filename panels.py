@@ -3056,6 +3056,7 @@ class LayersPanel(QWidget):
     activeChanged = Signal()
     selectionChanged = Signal()
     textEditRequested = Signal(int)      # 想编辑第 N 段文字
+    onionToggled = Signal(bool)          # 洋葱皮开关（面板上的小按钮）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3090,6 +3091,20 @@ class LayersPanel(QWidget):
 
         # 顶部：只有不透明度（混合模式按需求已整体移除）
         top = Section("图层")
+        # 洋葱皮：多层文档里专注当前这一层，其余层压暗（纯显示，不影响导出）
+        self.onion_btn = QToolButton()
+        self.onion_btn.setFixedSize(20, 20)
+        self.onion_btn.setCheckable(True)
+        self.onion_btn.setIcon(icons.icon("onion", C.ICON, 14))
+        self.onion_btn.setCursor(Qt.PointingHandCursor)
+        self.onion_btn.setToolTip("洋葱皮：当前图层正常显示，其余图层压暗\n"
+                                  "只影响屏幕显示，导出 / PSD 不受影响　Ctrl+Shift+K")
+        self.onion_btn.setStyleSheet(
+            "QToolButton { border: none; background: transparent; border-radius: 3px; }"
+            f"QToolButton:hover {{ background: {C.HOVER}; }}"
+            f"QToolButton:checked {{ background: {C.ACCENT}; }}")
+        self.onion_btn.toggled.connect(self.onionToggled.emit)
+        top.head_extra.addWidget(self.onion_btn)
         self.active_label = QLabel("")
         self.active_label.setStyleSheet(f"color: {C.TEXT}; font-size: 12px;")
         top.head_extra.addWidget(self.active_label)
@@ -3355,6 +3370,15 @@ class LayersPanel(QWidget):
         self.doc = doc
         self.refresh()
 
+    def set_onion(self, on: bool):
+        """同步洋葱皮按钮状态（菜单 / 快捷键改了也要跟着亮）。"""
+        btn = getattr(self, "onion_btn", None)
+        if btn is None or btn.isChecked() == bool(on):
+            return
+        btn.blockSignals(True)
+        btn.setChecked(bool(on))
+        btn.blockSignals(False)
+
     def refresh(self):
         # 清空（先从布局摘掉再销毁，避免残留控件盖住新行）
         while self.list_lay.count():
@@ -3372,6 +3396,13 @@ class LayersPanel(QWidget):
         # 组装显示列表：文字（浮在最上层）→ 组标题 + （展开时）组内文字与成员，
         # 成员按 z 序自上而下
         doc = self.doc
+        # 结构变了以后，选中集合可能还停在旧下标上（刚加/删图层最常见）。
+        # 不纠正就会出现「面板显示选中第 1 行、实际活动层是第 2 层」——
+        # 用户点第 1 行只会「取消选中」，切不过去，于是「切了图层但操作还作用
+        # 在原来那层」。这里把两边强制对齐。
+        self.selected &= set(range(len(doc.layers)))
+        if not getattr(self, "_empty_ok", False) and doc.active not in self.selected:
+            self.selected = {doc.active}
         # 文字下标越界（删掉了 / 撤销了）就清掉，否则垃圾桶会去删别人的字
         if self.active_text is not None and not (0 <= self.active_text < len(doc.texts)):
             self.active_text = None
@@ -3485,7 +3516,8 @@ class LayersPanel(QWidget):
             lo, hi = sorted((anchor, index))
             self.selected = set(range(lo, hi + 1))
             self.doc.active = index
-        elif self.selected == {index} and not self.selected_texts:
+        elif (self.selected == {index} and index == self.doc.active
+              and not self.selected_texts):
             # 再点一下同一行 = 取消选中（用户要的「单击选中、再单击取消」）
             self.selected = set()
             self._empty_ok = True

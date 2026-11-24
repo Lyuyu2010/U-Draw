@@ -419,6 +419,53 @@ def _draw(p: QPainter, name: str):
         p.setBrush(Qt.NoBrush)
 
 
+    elif name == "grid":
+        # 九宫格：外框 + 两条竖线 + 两条横线
+        p.drawRect(QRectF(3.2, 3.2, 13.6, 13.6))
+        p.setPen(QPen(col, 1.2))
+        for t in (1.0 / 3.0, 2.0 / 3.0):
+            p.drawLine(QPointF(3.2 + 13.6 * t, 3.2), QPointF(3.2 + 13.6 * t, 16.8))
+            p.drawLine(QPointF(3.2, 3.2 + 13.6 * t), QPointF(16.8, 3.2 + 13.6 * t))
+
+    elif name == "onion":
+        # 三层错开的圆 = 洋葱皮的「叠层」
+        for dx, dy, alpha in ((-3.0, 1.5, 80), (0.0, 0.0, 150), (3.0, -1.5, 255)):
+            c2 = QColor(col)
+            c2.setAlpha(alpha)
+            p.setPen(QPen(c2, 1.5))
+            p.setBrush(Qt.NoBrush)
+            p.drawEllipse(QRectF(10 + dx - 4.4, 10 + dy - 4.4, 8.8, 8.8))
+
+
+    elif name == "image":
+        # 相框 + 远山 + 太阳
+        p.drawRoundedRect(QRectF(2.6, 3.8, 14.8, 12.4), 1.4, 1.4)
+        path = QPainterPath(QPointF(3.9, 15.2))
+        path.lineTo(7.5, 9.8)
+        path.lineTo(10.2, 12.7)
+        path.lineTo(12.3, 10.3)
+        path.lineTo(16.1, 15.2)
+        p.setPen(QPen(col, 1.5))
+        p.drawPath(path)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(col))
+        p.drawEllipse(QPointF(12.7, 7.2), 1.15, 1.15)
+        p.setBrush(Qt.NoBrush)
+
+    elif name == "flip_h":
+        # 竖虚线中轴 + 左右两个三角形（右边淡一些 = 翻转后的那一半）
+        p.setPen(_dashed(QPen(col, 1.2), 2.0, 1.8))
+        p.drawLine(QPointF(10.0, 3.4), QPointF(10.0, 16.6))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(col))
+        p.drawPolygon(QPolygonF([QPointF(7.4, 5.4), QPointF(7.4, 14.6), QPointF(2.6, 10.0)]))
+        c2 = QColor(col)
+        c2.setAlpha(110)
+        p.setBrush(QBrush(c2))
+        p.drawPolygon(QPolygonF([QPointF(12.6, 5.4), QPointF(12.6, 14.6), QPointF(17.4, 10.0)]))
+        p.setBrush(Qt.NoBrush)
+
+
 _cache = {}
 
 

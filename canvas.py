@@ -5,8 +5,8 @@ import math
 import os
 import time
 
-from PySide6.QtCore import (QEvent, QPoint, QPointF, QRect, QRectF, Qt,
-                            QTimer, Signal)
+from PySide6.QtCore import (QEvent, QPoint, QPointF, QRect, QRectF, QSizeF,
+                            Qt, QTimer, Signal)
 from PySide6.QtGui import (QBrush, QColor, QCursor, QImage, QImageReader,
                            QKeyEvent, QPainter, QPainterPath, QPen, QPixmap,
                            QPolygonF, QRegion, QTextCursor, QTransform)
@@ -20,6 +20,8 @@ import fonts as fontlib
 from theme import C
 
 MIN_ZOOM, MAX_ZOOM = 0.02, 32.0
+# 放大到这个倍率以上才切成「像素清晰」（不平滑）。见 paintEvent 里的说明。
+SMOOTH_ZOOM_LIMIT = 4.0
 
 # 拖进来就能当图层用的图片后缀
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff",
@@ -56,6 +58,8 @@ class Canvas(QWidget):
     cursorMoved = Signal(QPointF)
     docChanged = Signal()
     historyChanged = Signal()
+    selectionMade = Signal()      # 新选区刚画好：主窗口据此记住「选区是从哪层来的」
+    selectionChanged = Signal()   # 选区有任何变化（新建 / 取消 / 撤销）
     colorPicked = Signal(QColor)
     brushSizeChanged = Signal(float)
     brushOpacityChanged = Signal(float)
@@ -94,6 +98,13 @@ class Canvas(QWidget):
         self.simulate_pressure = False  # 鼠标默认等粗；需要时可手动开（数位板始终用真实压力）
 
         self._stroke = None
+        # 浮动副本：复制出来的那一份还没落地时挂在这里
+        self._float = None
+        self._float_drag = None
+        self._float_sel = None       # 浮动开始时的那份选区（跟着内容一起平移）
+        # 主窗口挂上来的钩子：滤镜预览期间拦住「想干别的」的操作
+        self.filter_guard = None     # 返回 False = 吞掉这次操作
+        self.filter_key = None       # 返回 True = 这次按键已被滤镜处理
         self._panning = False
         self._pan_from = QPointF()
         self._pan_origin = (0.0, 0.0)
@@ -351,7 +362,106 @@ class Canvas(QWidget):
             self._text.set_zoom(self.zoom)
             self._text.reposition()
 
+    # ------------------------------------------------------------ 浮动副本
+    def _draw_float(self, p: QPainter):
+        f = self._float
+        if f is None:
+            return
+        img = f["img"]
+        sp = self.doc_to_screen(f["pos"])
+        w = img.width() * self.zoom
+        h = img.height() * self.zoom
+        p.setRenderHint(QPainter.SmoothPixmapTransform,
+                        self.zoom < SMOOTH_ZOOM_LIMIT or self.smooth_zoom)
+        p.drawImage(QRectF(sp.x(), sp.y(), w, h), img)
+        # 虚线框：提示「这块还在浮动、没落地」
+        p.setRenderHint(QPainter.Antialiasing, False)
+        pen = QPen(QColor(C.ACCENT), 1, Qt.DashLine)
+        pen.setCosmetic(True)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(QRectF(sp.x(), sp.y(), w, h))
+
+    def float_rect(self) -> QRectF:
+        f = self._float
+        if f is None:
+            return QRectF()
+        img = f["img"]
+        return QRectF(f["pos"], QSizeF(img.width(), img.height()))
+
+    def begin_float(self, img: QImage, pos: QPointF, layer) -> bool:
+        """挂一块「浮动副本」：画在最上层、可以拖，落地时才写进图层。
+
+        复制（Ctrl+C）靠它实现「在原图层上复制一份，直接拖走」——
+        不新建图层、不动原内容，撤销也只有一步。
+        """
+        if img is None or img.isNull() or layer is None:
+            return False
+        self.set_tool("move")            # 先切工具（顺带把上一块浮动落地）
+        self._float = {"img": img, "pos": QPointF(pos), "layer": layer,
+                       "origin": QPointF(pos)}
+        # 选区要跟着内容一起走（PS 就是这样）。不跟着走的话，拖完蚂蚁线还留在
+        # 原地，看着就像「只复制了选区框、内容没动」。
+        self._float_sel = (QPainterPath(self.doc.selection)
+                           if self.doc.has_selection() else None)
+        self._float_drag = None
+        self.update()
+        return True
+
+    def commit_float(self):
+        """浮动副本落地：写进图层，记一条可撤销的 PixelEdit。"""
+        f = self._float
+        if f is None:
+            return None
+        self._float = None
+        self._float_drag = None
+        self._float_sel = None       # 浮动开始时的那份选区（跟着内容一起平移）
+        # 主窗口挂上来的钩子：滤镜预览期间拦住「想干别的」的操作
+        self.filter_guard = None     # 返回 False = 吞掉这次操作
+        self.filter_key = None       # 返回 True = 这次按键已被滤镜处理
+        self._float_sel = None
+        layer = f["layer"]
+        img = f["img"]
+        r = QRectF(f["pos"], QSizeF(img.width(), img.height())).toAlignedRect()
+        r = r.intersected(QRect(0, 0, layer.image.width(), layer.image.height()))
+        self.update()
+        if r.isEmpty():
+            return None
+        before = layer.image.copy(r)
+        p = QPainter(layer.image)
+        p.drawImage(f["pos"], img)
+        p.end()
+        layer.touch()
+        layer.has_content = True
+        after = layer.image.copy(r)
+        self.doc.recompose(r)
+        edit = PixelEdit(layer, r, before, after)
+        self.doc.push(edit)
+        self.historyChanged.emit()
+        self.docChanged.emit()
+        self.update()
+        return edit
+
+    def cancel_float(self):
+        """放弃这次复制（什么都没写进图层，所以不需要还原像素）。"""
+        if self._float is None:
+            return
+        if self._float_sel is not None:
+            self.doc.selection = QPainterPath(self._float_sel)
+        self._float_sel = None
+        self._float = None
+        self._float_drag = None
+        self._float_sel = None       # 浮动开始时的那份选区（跟着内容一起平移）
+        # 主窗口挂上来的钩子：滤镜预览期间拦住「想干别的」的操作
+        self.filter_guard = None     # 返回 False = 吞掉这次操作
+        self.filter_key = None       # 返回 True = 这次按键已被滤镜处理
+        self.update()
+
+    def has_float(self) -> bool:
+        return self._float is not None
+
     def set_tool(self, tool: str):
+        self.commit_float()              # 切工具 = 浮动副本落地
         if getattr(self, "_tf", None) is not None:
             self.commit_transform()      # 切工具时先把变换落地
         if tool != "text":
@@ -457,13 +567,17 @@ class Canvas(QWidget):
         p.fillRect(dr, QBrush(CHECKER))
         p.restore()
 
-        # 画面合成：200% 以上默认**不平滑** —— 每个文档像素就是屏幕上的一块方块，
-        # 硬笔描线的边缘才是它真正的样子。以前一律开平滑插值，380% 下那圈 1px 的
-        # 抗锯齿被插值拉成 10 个屏幕像素的灰边（实测），看着就是「抗锯齿特别大」。
-        # 200% 以下（缩小、适应窗口）必须平滑，否则细节会闪成噪点。
-        # 想在放大时也柔一点：视图 → 放大时平滑显示。
+        # 画面合成：默认在 400% 以下平滑插值，再往上才「像素清晰」。
+        #
+        # 以前阈值是 200%：一到 266% 这种常用放大倍率，每个文档像素就变成
+        # 2.66px 的硬方块，6px 的硬笔描边看着全是阶梯（用户反馈的「边缘锯齿」）。
+        # 实测同一笔在 266% 下：不平滑 = 硬阶梯，平滑 = 连续边缘 —— 锯齿是
+        # **显示路径**造成的，不是笔刷没做抗锯齿（笔刷本身有 1px 羽化）。
+        # Photoshop 也是到 500% 左右才显像素块，这里取 400% 折中：
+        # 看清像素结构够用，日常画线又不会被放大成楼梯。
+        # 想一直平滑：视图 → 放大时平滑显示。
         p.setRenderHint(QPainter.SmoothPixmapTransform,
-                        self.zoom < 2.0 or self.smooth_zoom)
+                        self.zoom < SMOOTH_ZOOM_LIMIT or self.smooth_zoom)
         # 只画屏幕可见的那一块源图：大画布 / 放大时不再把整张合成图缩放一遍，
         # 喷点笔这类需要每帧重绘的笔触才不会因为画布大而掉帧。
         visible = dr.intersected(QRectF(self.rect()))
@@ -472,9 +586,19 @@ class Canvas(QWidget):
             sy = (visible.top() - self.oy) / self.zoom
             sw = visible.width() / self.zoom
             sh = visible.height() / self.zoom
-            p.drawImage(visible, self.doc.composite, QRectF(sx, sy, sw, sh))
+            # 洋葱皮开着就换成「视图图」（当前层正常、其余压暗）；
+            # 合成图 composite 本身不动，导出 / PSD 完全不受影响。
+            src = self.doc.composite
+            if getattr(self.doc, "onion", False) and len(self.doc.layers) > 1:
+                # 多选图层时，选中的那几层也保持正常显示
+                keep = set(getattr(self, "layer_selection", None) or ())
+                keep.add(self.doc.active)
+                src = self.doc.view_image(self.doc.active, self.doc.onion_dim, keep=keep)
+            p.drawImage(visible, src, QRectF(sx, sy, sw, sh))
         # 文字对象允许放到画布外：合成图只有画布大小，外面的部分在这里补画。
         self._draw_texts_outside(p)
+        # 浮动副本画在最上层，跟着鼠标走
+        self._draw_float(p)
 
         # 边线
         p.setRenderHint(QPainter.Antialiasing, False)
@@ -664,7 +788,11 @@ class Canvas(QWidget):
 
     def _draw_selection(self, p: QPainter):
         paths = []
-        if self.doc.has_selection():
+        if self._move is not None and self.doc.has_selection():
+            # 拖动选区内容时，蚂蚁线要跟着内容走（松手后才真正落到 doc.selection）
+            ox, oy = getattr(self._move, "off", (0.0, 0.0))
+            paths.append(self.doc.selection.translated(ox, oy))
+        elif self.doc.has_selection():
             paths.append(self.doc.selection)
         if self._sel_path is not None:
             paths.append(self._sel_path)
@@ -914,10 +1042,26 @@ class Canvas(QWidget):
     def pointer_down(self, pos: QPointF, pressure: float, button=Qt.LeftButton,
                      mods=Qt.NoModifier):
         self.setFocus()
+        # 滤镜预览中：只有「会改动内容」的操作才拦（落笔 / 填充 / 选色之外的工具）。
+        # 平移画布（空格拖、中键、抓手）和吸管不该弹框 —— 用户只是想看看别处。
+        if self.filter_guard is not None:
+            moving = (button != Qt.LeftButton or self._space
+                      or self.tool in ("hand", "eyedropper"))
+            if not moving and self.filter_guard() != "none":
+                return
         # 在画布上动手了：图层面板里「选中的文字」要取消，
         # 否则之后按 Backspace 会去删上一次选的那段字，而不是当前图层。
         if self.tool != "text":
             self.canvasTouched.emit()
+        # 浮动副本：点在它上面就开始拖，点别处就落地
+        if self._float is not None:
+            dp = self.screen_to_doc(pos)
+            if self.float_rect().contains(dp):
+                self._float_drag = dp - self._float["pos"]
+                self.setCursor(Qt.ClosedHandCursor)
+                self._cursor_key = Qt.ClosedHandCursor
+                return
+            self.commit_float()
         if self._tf is not None:
             mode, idx = self._tf_hit(pos)
             if mode is None:
@@ -1111,6 +1255,17 @@ class Canvas(QWidget):
             self.update()
             return
 
+        if self._float_drag is not None and self._float is not None:
+            f = self._float
+            f["pos"] = self.screen_to_doc(pos) - self._float_drag
+            if self._float_sel is not None:
+                dx = f["pos"].x() - f["origin"].x()
+                dy = f["pos"].y() - f["origin"].y()
+                self.doc.selection = self._float_sel.translated(dx, dy)
+            self.update()
+            self.cursorMoved.emit(self.screen_to_doc(pos))
+            return
+
         if self._sym_drag:
             d = self.screen_to_doc(pos)
             self.symmetry["cx"] = max(0.0, min(float(self.doc.w), d.x()))
@@ -1137,9 +1292,14 @@ class Canvas(QWidget):
             d = self.screen_to_doc(pos)
             dx = d.x() - self._move_start.x()
             dy = d.y() - self._move_start.y()
+            # 只重绘「上一帧 ∪ 这一帧」的区域：大画布拖动不再整屏合成 → 不卡
+            dirty = None
             for op in (self._moves or [self._move]):
-                op.render(dx, dy)
-            self.doc.recompose()
+                r = op.render(dx, dy)
+                if r is not None and not r.isEmpty():
+                    dirty = r if dirty is None else dirty.united(r)
+            if dirty is not None and not dirty.isEmpty():
+                self.doc.recompose(dirty)
             self.update()
             self.cursorMoved.emit(d)
             return
@@ -1199,6 +1359,11 @@ class Canvas(QWidget):
             self._stroke_timer.stop()
 
     def pointer_up(self):
+        if self._float_drag is not None:
+            self._float_drag = None
+            self.setCursor(Qt.SizeAllCursor)
+            self.update()
+            return
         if self._text_move is not None:
             it, start, ox, oy = self._text_move
             moved = abs(it.x - ox) > 0.01 or abs(it.y - oy) > 0.01
@@ -1215,6 +1380,17 @@ class Canvas(QWidget):
             self.doc.recompose()
             self.update()
             return
+        if self._float_drag is not None and self._float is not None:
+            f = self._float
+            f["pos"] = self.screen_to_doc(pos) - self._float_drag
+            if self._float_sel is not None:
+                dx = f["pos"].x() - f["origin"].x()
+                dy = f["pos"].y() - f["origin"].y()
+                self.doc.selection = self._float_sel.translated(dx, dy)
+            self.update()
+            self.cursorMoved.emit(self.screen_to_doc(pos))
+            return
+
         if self._sym_drag:
             self._sym_drag = False
             self._sym_hot = False
@@ -1391,7 +1567,9 @@ class Canvas(QWidget):
         返回 False 表示已经退到头了，调用方可以去取消整个变换。
         """
         tf = self._tf
-        if tf is None or not tf.steps:
+        if tf is None:
+            return False
+        if not tf.steps:
             return False
         tf.set_state(tf.steps.pop())
         tf.render()
@@ -1418,7 +1596,13 @@ class Canvas(QWidget):
         op = self._tf
         self._tf = None
         self._tf_mode = None
-        edit = op.finish()
+        # 落地要按全分辨率重采样（几百毫秒），给个等待光标，
+        # 不然用户会以为点空了又点一次
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            edit = op.finish()
+        finally:
+            QApplication.restoreOverrideCursor()
         self.doc.push(edit)
         self.doc.recompose()
         self.update()
@@ -1546,7 +1730,9 @@ class Canvas(QWidget):
 
     def _tf_drag(self, pos: QPointF):
         tf = self._tf
-        if tf is None or self._tf_saved is None:
+        if tf is None:
+            return
+        if self._tf_saved is None:
             return
         c0, w0, h0, a0 = self._tf_saved
         cur = self.screen_to_doc(pos)
@@ -1676,6 +1862,8 @@ class Canvas(QWidget):
             self.doc.set_selection(self.doc.selection.subtracted(path))
         else:
             self.doc.set_selection(path)
+        self.selectionMade.emit()
+        self.sync_selection_ants()
 
     # ------------------------------------------------------------ 事件
     def warm_brush_cache(self):
@@ -1688,6 +1876,7 @@ class Canvas(QWidget):
 
     def sync_selection_ants(self):
         """选区变了（含撤销/重做）之后，让蚂蚁线跟着动起来或者停下来。"""
+        self.selectionChanged.emit()
         if self.doc.has_selection():
             if not self._ants_timer.isActive():
                 self._ants_timer.start()
@@ -1941,6 +2130,18 @@ class Canvas(QWidget):
         self.set_zoom(self.zoom * factor, pos)
 
     def keyPressEvent(self, e: QKeyEvent):
+        if self.filter_key is not None and self.filter_key(e.key()):
+            e.accept()
+            return
+        if self._float is not None:
+            if e.key() in (Qt.Key_Return, Qt.Key_Enter):
+                self.commit_float()
+                e.accept()
+                return
+            if e.key() == Qt.Key_Escape:
+                self.cancel_float()
+                e.accept()
+                return
         if self._tf is not None:
             if e.key() in (Qt.Key_Return, Qt.Key_Enter):
                 self.commit_transform()
@@ -1950,6 +2151,16 @@ class Canvas(QWidget):
                 self.cancel_transform()
                 e.accept()
                 return
+        # Esc：没有浮动副本 / 变换 / 文字编辑时，取消选区（比记 Ctrl+D 更符合直觉）。
+        # 文字工具下**不接管** —— 那边 Esc 是「结束这段文字」，不能被选区抢走。
+        if (e.key() == Qt.Key_Escape and self.tool != "text"
+                and getattr(self, "_text", None) is None
+                and self.doc.has_selection()):
+            self.doc.clear_selection()
+            self.sync_selection_ants()
+            self.update()
+            e.accept()
+            return
         if e.key() == Qt.Key_Space and not e.isAutoRepeat():
             self._space = True
             if not self._panning:

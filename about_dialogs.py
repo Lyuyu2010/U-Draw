@@ -184,6 +184,18 @@ def _brush_counts():
     return 133, 17
 
 
+def _kind_count() -> int:
+    """内置笔型（笔尖形态）数量 —— 同样按库统计，不写死。"""
+    try:
+        import brushes
+        used = {b.kind for b in brushes.DEFAULTS}
+        if used:
+            return len(used)
+    except Exception:
+        pass
+    return 55
+
+
 class AboutDialog(QDialog):
     def __init__(self, app_name: str, version: str, parent=None):
         super().__init__(parent)
@@ -201,10 +213,11 @@ class AboutDialog(QDialog):
         lay.addWidget(_section("核心能力"))
         # 数量直接从笔刷库统计，避免文案和实际笔刷数对不上（以前写死 102，实际 133）
         n_brush, n_group = _brush_counts()
+        n_kind = _kind_count()
         feats = [
             f"笔刷：内置 {n_brush} 支，分 {n_group} 类（铅笔 / 勾线 / 炭笔粉笔 / 马克笔 / "
             "水彩 / 油画 / 蜡笔色粉 / 喷枪 / 纹理 / 网点 / 特效 / 印章形状 / 植被花卉 / "
-            "图案装饰 / 毛发织物 / 光效天气 等）；23 种笔尖形态，22 项参数分六组可调",
+            f"图案装饰 / 毛发织物 / 光效天气 等）；{n_kind} 种笔尖形态，22 项参数分六组可调",
             "压感：笔迹粗细与浓度随压力变化，可设「最小直径」限定最细程度",
             "绘制辅助：对称绘制（垂直 / 水平 / 四象限 / 径向 2–24 轴）、涂抹混色、"
             "画布内文字编辑",

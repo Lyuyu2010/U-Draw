@@ -1,7 +1,7 @@
 ﻿VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(2, 15, 42, 0),
-    prodvers=(2, 15, 26, 0),
+    filevers=(3, 0, 0, 0),
+    prodvers=(3, 0, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -15,11 +15,11 @@
         '080404B0',
         [StringStruct('CompanyName', 'U Draw'),
          StringStruct('FileDescription', 'U Draw 绘画软件'),
-         StringStruct('FileVersion', '2.15.42'),
+         StringStruct('FileVersion', '3.0.0-beta1'),
          StringStruct('InternalName', 'U Draw'),
          StringStruct('OriginalFilename', 'U Draw.exe'),
          StringStruct('ProductName', 'U Draw'),
-         StringStruct('ProductVersion', '2.15.26')])
+         StringStruct('ProductVersion', '3.0.0-beta1')])
     ]),
     VarFileInfo([VarStruct('Translation', [2052, 1200])])
   ]

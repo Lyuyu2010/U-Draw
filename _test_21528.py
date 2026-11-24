@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """2.15.28 的三处改动验证：
-  1. 关于对话框笔刷数量与实际一致（133 支 / 17 类）
+  1. 关于对话框笔刷数量与实际一致（数量随笔刷库变化，不写死）
   2. 笔从画布边缘拖出去后，笔尖圈不会卡在边上（_inside 不再被无条件置 True）
   3. Shift+P / Shift+O 能切压感两个开关
 """
@@ -35,8 +35,10 @@ check("不再是 102", n != 102, f"{n}")
 dlg = AboutDialog(APP_NAME, APP_VERSION)
 from PySide6.QtWidgets import QLabel
 joined = " ".join(w.text() for w in dlg.findChildren(QLabel) if w.text())
-check("关于正文写的是 133 支 / 17 类", "133 支" in joined and "17 类" in joined,
-      "命中" if ("133 支" in joined and "17 类" in joined) else joined[:60])
+# 断言写成「文案 == 实际数量」而不是写死 133：以后加笔刷不会再误报
+check(f"关于正文写的是实际数量（{n} 支 / {g} 类）",
+      f"{n} 支" in joined and f"{g} 类" in joined,
+      "命中" if (f"{n} 支" in joined and f"{g} 类" in joined) else joined[:60])
 dlg.deleteLater()
 
 # 2. 光标不再卡在边缘

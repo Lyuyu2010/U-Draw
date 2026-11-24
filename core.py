@@ -13,8 +13,8 @@ from dataclasses import dataclass
 
 from PySide6.QtCore import QBuffer, QIODevice, QPoint, QPointF, QRect, QRectF, Qt
 from PySide6.QtGui import (QBrush, QColor, QFontMetricsF, QImage, QPainter,
-                           QPainterPath, QPen, QPixmap, QRadialGradient,
-                           QTextDocument, QTransform)
+                           QPainterPath, QPen, QPixmap, QPolygonF,
+                           QRadialGradient, QTextDocument, QTransform)
 
 if __package__:
     from . import special_tips
@@ -2349,7 +2349,6 @@ class StructEdit:
         return self.label_
 
 
-# ---------------------------------------------------------------- 图层
 class LayerGroup:
     """图层组：只做分类 / 整体显示隐藏 / 整组锁定，成员仍是普通图层。"""
 
@@ -2595,6 +2594,12 @@ class Document:
         self.texts = []            # TextItem：浮在图层之上的「活」文字
         self._gseq = 0
         self.selection = None      # QPainterPath（文档坐标）
+        # 洋葱皮：**只影响画布显示**（走 view_image），不进 composite，
+        # 否则导出的 PNG / PSD 会带着别的图层一起变淡
+        self.onion = False
+        self.onion_dim = 0.35
+        self._view_rev = 0         # 合成版本号：recompose 一次 +1，视图缓存据此失效
+        self._view_cache = None    # (key, QImage)
         self.undo_stack = []
         self.redo_stack = []
         self.path = None
@@ -3000,6 +3005,80 @@ class Document:
             it.draw(p)
         p.setOpacity(1.0)
         p.end()
+        # 合成变了，洋葱皮的视图缓存就过期了（版本号比逐层比对便宜得多）
+        self._view_rev += 1
+
+    # -- 视图层效果（洋葱皮）----------------------------------------
+    def view_image(self, active_idx: int = None, dim: float = None,
+                   keep=None) -> QImage:
+        """洋葱皮视图：要「聚焦」的图层正常显示，其余图层整体压暗。
+
+        keep = 需要正常显示的图层下标集合（不传就只算当前层）。
+        多选图层时把选中的几层一起放进来 —— 用户 Ctrl 点了几层准备一起移动，
+        结果只看得到其中一层正常、其余全淡下去，会很莫名其妙。
+
+        背景层不压暗 —— 它是「纸」，压暗之后整块画布会透出透明棋盘，
+        看着像画面消失了。其余图层照常乘压暗系数。
+
+        这是**纯显示效果**，所以刻意不写进 composite —— composite 会被
+        flatten() / export_image() / PSD 导出直接消费，把压暗画进去，
+        导出的图就会带着别的图层一起变淡。
+
+        文字对象不在图层里，只能按「是否和当前图层同组」判断归属：
+        同组的正常显示，其余跟着压暗。z 序仍然保持「文字盖在所有图层之上」。
+        """
+        idx = self.active if active_idx is None else int(active_idx)
+        d = self.onion_dim if dim is None else float(dim)
+        d = _clamp(d, 0.0, 1.0)
+        if keep is None:
+            keep_set = {idx}
+        else:
+            keep_set = {int(i) for i in keep if 0 <= int(i) < len(self.layers)}
+        if 0 <= idx < len(self.layers):
+            keep_set.add(idx)
+        key = (tuple(sorted(keep_set)), round(d, 3), self._view_rev)
+        if self._view_cache is not None and self._view_cache[0] == key:
+            return self._view_cache[1]
+
+        img = QImage(self.w, self.h, FORMAT_ARGB)
+        img.fill(Qt.transparent)
+        act = self.layers[idx] if 0 <= idx < len(self.layers) else None
+        keep_layers = [self.layers[i] for i in keep_set if 0 <= i < len(self.layers)]
+        p = QPainter(img)
+        p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        # ① 其余图层：统一乘压暗系数
+        for layer in self.layers:
+            if layer in keep_layers:
+                continue
+            vis, op = self.layer_state(layer)
+            if not vis or op <= 0.0:
+                continue
+            p.setOpacity(op if getattr(layer, "is_bg", False) else op * d)
+            p.drawImage(0, 0, layer.image)
+        # ② 要聚焦的图层：原样盖上去（按 z 序，后面的盖前面的）
+        for layer in keep_layers:
+            vis, op = self.layer_state(layer)
+            if not vis or op <= 0.0:
+                continue
+            p.setOpacity(op)
+            p.drawImage(0, 0, layer.image)
+        # ③ 文字在最上层
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.TextAntialiasing, True)
+        act_group = act.group if act is not None else None
+        for it in self.texts:
+            if it.editing:
+                continue
+            vis, op = self.text_state(it)
+            if not vis or op <= 0.0:
+                continue
+            same = act_group is not None and getattr(it, "group", "") == act_group
+            p.setOpacity(op if same else op * d)
+            it.draw(p)
+        p.setOpacity(1.0)
+        p.end()
+        self._view_cache = (key, img)
+        return img
 
     # -- 文字对象 ---------------------------------------------------
     def add_text(self, item: "TextItem") -> int:
@@ -3173,6 +3252,35 @@ class Document:
             self.set_selection(full)
 
     # -- 编辑操作 ---------------------------------------------------
+    def extract_selection_pixels(self, layer=None):
+        """把选区内的像素抠出来，返回 (QImage, QPoint)；没有选区或选区为空返回 None。
+
+        QImage 只含选区内的内容（选区外透明），QPoint 是它在文档里的左上角。
+
+        用 Alpha 蒙版做「挖洞」，不用 clipPath —— clipPath 在斜边/圆边上会留下
+        硬边，蒙版走 Antialiasing 才能保住原图那圈抗锯齿。
+        """
+        layer = self.layer if layer is None else layer
+        if layer is None or not self.has_selection():
+            return None
+        r = self.selection.boundingRect().toAlignedRect()
+        r = r.intersected(QRect(0, 0, layer.image.width(), layer.image.height()))
+        if r.isEmpty():
+            return None
+        out = layer.image.copy(r)
+        mask = QImage(r.size(), FORMAT_ARGB)
+        mask.fill(Qt.transparent)
+        mp = QPainter(mask)
+        mp.setRenderHint(QPainter.Antialiasing, True)
+        mp.translate(-r.x(), -r.y())
+        mp.fillPath(self.selection, QBrush(QColor(255, 255, 255, 255)))
+        mp.end()
+        cp = QPainter(out)
+        cp.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+        cp.drawImage(0, 0, mask)
+        cp.end()
+        return out, r.topLeft()
+
     def clear_area(self):
         layer = self.layer
         if layer is None or self.is_locked(layer):
@@ -3212,8 +3320,30 @@ class Document:
         self.recompose(r)
         return PixelEdit(layer, r, before.copy(r), layer.image.copy(r))
 
+def _outside_has_content(img: QImage, ox: float, oy: float, w: int, h: int,
+                         step: int = 4) -> bool:
+    """把 img 摆到 (ox,oy) 之后，画布外面还有没有不透明像素。"""
+    iw, ih = img.width(), img.height()
+    x0, y0 = int(round(ox)), int(round(oy))
+    for yy in range(0, ih, step):
+        dy = y0 + yy
+        if 0 <= dy < h:
+            if x0 < 0:
+                for xx in range(0, min(iw, -x0), step):
+                    if (img.pixel(xx, yy) >> 24) & 0xFF:
+                        return True
+            if x0 + iw > w:
+                for xx in range(max(0, w - x0), iw, step):
+                    if (img.pixel(xx, yy) >> 24) & 0xFF:
+                        return True
+        else:
+            for xx in range(0, iw, step):
+                if (img.pixel(xx, yy) >> 24) & 0xFF:
+                    return True
+    return False
 
-# ---------------------------------------------------------------- 移动图层内容
+
+
 SNAP_PX = 8          # 移动时的吸附容差（像素）
 
 
@@ -3242,28 +3372,6 @@ def _fills_canvas(img: QImage, pos, w: int, h: int, step: int = 8) -> bool:
     return True
 
 
-def _outside_has_content(img: QImage, ox: float, oy: float, w: int, h: int,
-                         step: int = 4) -> bool:
-    """把 img 摆到 (ox,oy) 之后，画布外面还有没有不透明像素。"""
-    iw, ih = img.width(), img.height()
-    x0, y0 = int(round(ox)), int(round(oy))
-    for yy in range(0, ih, step):
-        dy = y0 + yy
-        if 0 <= dy < h:
-            if x0 < 0:
-                for xx in range(0, min(iw, -x0), step):
-                    if (img.pixel(xx, yy) >> 24) & 0xFF:
-                        return True
-            if x0 + iw > w:
-                for xx in range(max(0, w - x0), iw, step):
-                    if (img.pixel(xx, yy) >> 24) & 0xFF:
-                        return True
-        else:
-            for xx in range(0, iw, step):
-                if (img.pixel(xx, yy) >> 24) & 0xFF:
-                    return True
-    return False
-
 
 class MoveOp:
     """拖动平移图层内容：无选区时移动整层，有选区时只移动选区内的像素。"""
@@ -3279,6 +3387,8 @@ class MoveOp:
         self.off_before = layer.off
         self.pos_before = QPoint(layer.off_pos)
         self.snapped = False
+        self.off = (0.0, 0.0)      # 当前实际偏移（吸附后），画布用它画跟随的选区
+        self._prev_off = None      # 上一帧偏移，用于算脏矩形
         if self.sel is None:
             src, pos = layer.ext()
             # ext() 在没有画布外内容时返回的就是图层本身，必须拷贝一份：
@@ -3335,28 +3445,52 @@ class MoveOp:
         self.snapped = (abs(sx - ox) > 1e-6 or abs(sy - oy) > 1e-6)
         return sx, sy
 
-    def render(self, dx: float, dy: float):
+    def _dirty_rect(self, ox: float, oy: float) -> QRect:
+        """这一帧需要重绘的区域：上一帧位置 ∪ 这一帧位置（带外扩留抗锯齿余量）。"""
+        prev = getattr(self, "_prev_off", None)
+        if self.sel is None:
+            r_new = QRectF(ox, oy, self.src.width(), self.src.height())
+            px = self.base[0] + (prev[0] if prev else 0.0)
+            py = self.base[1] + (prev[1] if prev else 0.0)
+            r_old = QRectF(px, py, self.src.width(), self.src.height())
+        else:
+            sr = self.sel.boundingRect()
+            r_new = sr.translated(ox, oy)
+            r_old = sr.translated(prev[0], prev[1]) if prev else sr
+        return r_new.united(r_old).toAlignedRect().adjusted(-2, -2, 2, 2)
+
+    def render(self, dx: float, dy: float, full: bool = False):
+        """把内容按 (dx,dy) 重绘到图层。默认只重绘变化区域（拖动才不卡），
+        full=True 时整层重绘（落地时用，保证干净无接缝）。返回脏矩形。"""
         img = self.layer.image
         ox, oy = self._snap(self.base[0] + dx, self.base[1] + dy)
+        lw, lh = img.width(), img.height()
+        dirty = (QRect(0, 0, lw, lh) if full
+                 else self._dirty_rect(ox, oy).intersected(QRect(0, 0, lw, lh)))
+        self.off = (ox, oy)
+        self._prev_off = (ox, oy)
+        if dirty.isEmpty():
+            return dirty
         p = QPainter(img)
         p.setCompositionMode(QPainter.CompositionMode_Source)
-        p.fillRect(QRectF(0, 0, img.width(), img.height()), Qt.transparent)
+        p.fillRect(dirty, Qt.transparent)
+        p.setClipRect(dirty)
         if self.sel is None:
             p.drawImage(QPointF(ox, oy), self.src)
         else:
-            p.save()
-            p.setClipPath(self.full.subtracted(self.sel))
+            # 选区外：原样画回（限制在脏矩形内）
+            p.setClipPath(self.full.subtracted(self.sel), Qt.IntersectClip)
             p.drawImage(0, 0, self.src)
-            p.restore()
-            p.save()
-            p.setClipPath(self.sel.translated(ox, oy))
+            # 选区内：跟着拖到新位置
+            p.setClipRect(dirty, Qt.ReplaceClip)
+            p.setClipPath(self.sel.translated(ox, oy), Qt.IntersectClip)
             p.drawImage(QPointF(ox, oy), self.src)
-            p.restore()
         p.end()
         self.layer.touch()
+        return dirty
 
     def finish(self, dx: float, dy: float):
-        self.render(dx, dy)
+        self.render(dx, dy, full=True)
         ox, oy = self._snap(self.base[0] + dx, self.base[1] + dy)
         w = self.layer.image.width()
         h = self.layer.image.height()
@@ -3541,6 +3675,7 @@ class TransformOp:
         self.layer.touch()
         self.layer.has_content = True
 
+    # ------------------------------------------------------------ 网格变形
     def finish(self):
         self.render(extended=True)      # 落地时把画布外那部分也一起留住
         rect = QRect(0, 0, self.layer.image.width(), self.layer.image.height())

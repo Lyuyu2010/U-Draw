@@ -352,6 +352,38 @@ DEFAULTS = [
     _b("印章形状", "毛发笔", "grass", size=20, hardness=1.0, opacity=0.9, flow=0.85,
        spacing=0.1, grain=0.3, grain_scale=2, scatter=0.08, size_jitter=0.2,
        min_size=0.4, stabilize=0.12),
+
+    # ====================================================== v3.0 新增 10 支
+    # 全部复用已有笔型（marker / round / ballpoint / bristle / watercolor /
+    # chalk / noise / charcoal / spray），只靠参数组合做出区别 ——
+    # 不新增 kind，就不必碰 _make_stamp 那个大函数，回归风险为零。
+    _b("基础", "点彩圆笔", "round", size=10, hardness=1.0, opacity=1.0, flow=1.0,
+       spacing=1.15, min_size=0.8, stabilize=0.30),
+    _b("勾线", "勾线细笔", "ballpoint", size=2.5, hardness=1.0, opacity=1.0,
+       flow=1.0, spacing=0.01, min_size=0.9, pressure_size=False, stabilize=0.55),
+    _b("炭笔粉笔", "炭条侧涂", "charcoal", size=52, hardness=0.12, opacity=0.7,
+       flow=0.35, spacing=0.05, grain=0.6, grain_scale=5, roundness=0.35, angle=0,
+       min_size=0.5, stabilize=0.12),
+    _b("马克笔", "硬头马克笔", "marker", size=28, hardness=1.0, opacity=1.0,
+       flow=1.0, spacing=0.01, roundness=0.38, angle=45, min_size=0.85,
+       pressure_size=False, stabilize=0.26),
+    _b("马克笔", "酒精马克笔", "marker", size=32, hardness=0.88, opacity=0.30,
+       flow=0.85, spacing=0.02, roundness=0.55, angle=40, min_size=0.6,
+       build_up=True, stabilize=0.20),
+    _b("水彩", "渗边水彩", "watercolor", size=44, hardness=0.06, opacity=0.55,
+       flow=0.28, spacing=0.04, grain=0.5, grain_scale=5, wet=0.95, taper=0.2,
+       min_size=0.5, stabilize=0.10),
+    _b("油画", "平口排刷", "bristle", size=46, hardness=0.85, opacity=0.95,
+       flow=0.65, spacing=0.05, grain=0.25, grain_scale=4, roundness=0.35,
+       angle=0, min_size=0.7, stabilize=0.20),
+    _b("蜡笔色粉", "大号软粉", "chalk", size=58, hardness=0.06, opacity=0.45,
+       flow=0.3, spacing=0.06, grain=0.55, grain_scale=6, scatter=0.1,
+       size_jitter=0.12, min_size=0.6, stabilize=0.10),
+    _b("喷枪", "宽幅喷雾", "spray", size=70, hardness=0.5, opacity=0.5, flow=0.28,
+       spacing=0.35, scatter=0.45, size_jitter=0.3, min_size=0.45, stabilize=0.05),
+    _b("纹理", "粗颗粒笔", "noise", size=40, hardness=1.0, opacity=0.75, flow=0.45,
+       spacing=0.6, grain=0.5, grain_scale=3, pattern_scale=14, scatter=0.3,
+       size_jitter=0.3, min_size=0.4, stabilize=0.06),
 ]
 
 # 新库：每一种新笔型只有一个主预设，避免以细小调参凑数；旧名称完整保留。

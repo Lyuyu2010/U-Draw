@@ -15,7 +15,8 @@ from PySide6.QtCore import (QPoint, QPointF, QRect, QRectF, QSettings, QSize, Qt
                             QTimer, Signal)
 from PySide6.QtGui import (QAction, QColor, QCursor, QFont,
                            QGuiApplication,
-                           QIcon, QKeySequence, QPainter, QPen, QPixmap, QPolygonF)
+                           QIcon, QImage, QKeySequence, QPainter, QPainterPath,
+                           QPen, QPixmap, QPolygonF)
 from PySide6.QtWidgets import (QApplication, QColorDialog, QComboBox,
                                QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
                                QFrame, QGridLayout,
@@ -32,11 +33,13 @@ import psd_export
 from about_dialogs import AboutDialog, SponsorDialog
 from canvas import Canvas, load_image_file
 from core import (MAX_LAYERS, SPRAY_KINDS, STAMP_KINDS, SYM_MODES, SYM_NAMES,
-                  Brush, Document, StructEdit, export_image, load_project,
-                  open_image_as_document, save_project)
+                  Brush, Document, PixelEdit, StructEdit, export_image,
+                  load_project, open_image_as_document, save_project)
 from panels import (BrushPanel, ColorPanel, LayersPanel, PresetBar, RecentStore,
                     RecentSwatches, SymmetryPanel)
+from reference_window import ReferenceWindow
 from tab_strip import DocStrip  # noqa: F401  （测试与外部脚本按 main_window.DocStrip 取）
+import filters
 from theme import C
 
 # 内部剪贴板：带「从哪张画布、哪个位置复制的」，所以能贴回原位。
@@ -58,7 +61,8 @@ else:                        # 非 Windows：占位，标题栏停靠功能自�
 APP_NAME = "U Draw"
 DEFAULT_W, DEFAULT_H = 1920, 1080
 # 必须和 app/version_info.txt 里的 FileVersion 保持一致（标题栏 / 关于窗口都读这里）
-APP_VERSION = "2.15.42"
+# v3.0 开发线：S1~S3（第一梯队）已并入，S4~S9 完成后在 S9 定 3.0.0 正式号
+APP_VERSION = "3.0.0-beta1"
 
 # (组键, 名称, 快捷键, 图标, 子工具列表)  —— 选区三个工具合并成一个按钮
 TOOL_GROUPS = [
@@ -146,6 +150,7 @@ class ToolRail(QWidget):
     toolChanged = Signal(str)
     colorsSwapped = Signal()
     zoomStep = Signal(bool)         # True = 放大
+    referenceRequested = Signal()   # 打开参考图窗口
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -214,6 +219,22 @@ class ToolRail(QWidget):
                 self.zoom_in = zb
             else:
                 self.zoom_out = zb
+
+        # 参考图窗口：工具栏上的常驻入口。
+        # 以前只有「视图」菜单里一项，用户反馈「根本找不到」，所以在最常用的
+        # 左栏也放一个 —— 临摹的人第一眼就该看见它。
+        rb = QToolButton()
+        rb.setFixedSize(34, 30)
+        rb.setIconSize(QSize(17, 17))
+        rb.setIcon(icons.icon("image", C.TEXT_DIM, 17))
+        rb.setCursor(Qt.PointingHandCursor)
+        rb.setToolTip("参考图窗口（Ctrl+Shift+R）\n浮在画布上方，可缩放 / 翻转 / 调透明度")
+        rb.setStyleSheet(
+            "QToolButton { border: none; background: transparent; border-radius: 5px; }"
+            f"QToolButton:hover {{ background: {C.HOVER}; }}"
+            f"QToolButton:pressed {{ background: {C.PRESSED}; }}")
+        rb.clicked.connect(self.referenceRequested.emit)
+        lay.addWidget(rb, 0, Qt.AlignHCenter)
 
         # 前景 / 背景色块
         holder = QWidget()
@@ -482,6 +503,17 @@ class MainWindow(QWidget):
         self._views = {}          # id(doc) -> (zoom, ox, oy)
         self.brush = Brush()
         self.current_tool = "brush"
+        # 洋葱皮是「看图的习惯」而不是文档属性：窗口里存一份，切文档时同步给每份文档
+        self._onion = False
+        self._onion_dim = 0.35
+        self._refwin = None          # 参考图窗口（第一次点菜单才创建）
+        self._zoom_target = "canvas"  # 缩放快捷键作用在谁身上：canvas / ref
+        self._sel_layer = None        # 这块选区是从哪个图层圈出来的（跨层搬运用）
+        self._filter_state = None     # 滤镜预览状态（None = 没在预览）
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(80)
+        self._filter_timer.timeout.connect(self._filter_refresh)
         self._syncing_brush_sliders = False
         # 文字颜色 + 它自己的一排「最近使用」（跟颜色面板那份分开存）
         self._text_store = RecentStore("color/recent_text", 8)
@@ -558,7 +590,15 @@ class MainWindow(QWidget):
         self.options_layout.setContentsMargins(10, 0, 10, 0)
         self.options_layout.setSpacing(10)
         bar_lay.addStretch(1)                       # 拖高以后内容仍然居中
-        bar_lay.addWidget(self.options_inner)
+        # 选项和右侧常驻按钮必须同处**一行**：bar_lay 是 QVBoxLayout，
+        # 直接把按钮 addWidget 进来会掉到第二行去（第一版就这么翻的车）。
+        row = QWidget()
+        row_lay = QHBoxLayout(row)
+        row_lay.setContentsMargins(0, 0, 0, 0)
+        row_lay.setSpacing(0)
+        row_lay.addWidget(self.options_inner, 1)
+        row_lay.addWidget(self._build_sel_tools(), 0)
+        bar_lay.addWidget(row)
         bar_lay.addStretch(1)
 
         # 中部
@@ -785,11 +825,87 @@ class MainWindow(QWidget):
     # 这些是「关掉软件再打开应该还是老样子」的东西：颜色、当前工具、对称、
     # 形状参数、文字参数、模拟压感 / 移动自动选择。
     def set_smooth_zoom(self, on: bool):
-        """放大时是否平滑插值（默认关 = 像素清晰）。"""
+        """放大时是否始终平滑插值（默认关 = 400% 以下自动平滑）。"""
         self.canvas.smooth_zoom = bool(on)
         self.canvas.update()
-        self.hint.setText("放大显示：平滑插值（边缘会变柔）" if on
-                          else "放大显示：像素清晰（硬笔边缘保持锐利）")
+        self.hint.setText("放大显示：始终平滑（任何倍率边缘都不会出现阶梯）" if on
+                          else "放大显示：400% 以下自动平滑，再往上按像素清晰显示")
+
+    # ------------------------------------------------------------ 视图状态同步
+    def _sync_view_actions(self):
+        """把「洋葱皮」的开关状态同步到菜单项和图层面板按钮。"""
+        a = getattr(self, "a_onion", None)
+        if a is not None:
+            a.setChecked(bool(self._onion))
+        panel = getattr(self, "layers_panel", None)
+        if panel is not None and hasattr(panel, "set_onion"):
+            panel.set_onion(self._onion)
+
+    # ------------------------------------------------------------ 缩放路由
+    def _zoom_on_ref(self) -> bool:
+        return (self._zoom_target == "ref" and self._refwin is not None
+                and self._refwin.isVisible())
+
+    def zoom_step(self, up: bool):
+        """Ctrl+= / Ctrl+-：作用在最后点击的那个窗口上。"""
+        if self._zoom_on_ref():
+            self._refwin.zoom_step(up)
+        else:
+            self.canvas.zoom_step(up)
+
+    def zoom_fit(self):
+        """Ctrl+0。"""
+        if self._zoom_on_ref():
+            self._refwin.fit_window()
+        else:
+            self.fit_view()
+
+    def zoom_100(self):
+        """Ctrl+1。"""
+        if self._zoom_on_ref():
+            self._refwin.zoom_100()
+        else:
+            self.canvas.set_zoom(1.0)
+
+    def open_reference(self):
+        """参考图窗口：浮在画布上方，临摹时对着看。"""
+        if self._refwin is None:
+            self._refwin = ReferenceWindow(self)
+            self._refwin.closed.connect(self._on_reference_closed)
+            # 点了参考图窗口 → 缩放快捷键切到参考图
+            self._refwin.activated.connect(
+                lambda: setattr(self, "_zoom_target", "ref"))
+        self._refwin.show()
+        self._refwin.raise_()
+        self._refwin.activateWindow()
+        self.hint.setText("参考图窗口：把图片拖进去，或点左上角载入　"
+                          "滚轮缩放 · Ctrl+滚轮调透明度 · 双击标题栏适配")
+
+    def _on_reference_closed(self):
+        self._zoom_target = "canvas"
+        self.hint.setText("参考图窗口已关闭　视图 → 参考图窗口 可以再打开")
+
+    def toggle_onion(self, on: bool):
+        """洋葱皮：当前图层正常，其余图层压暗。纯显示效果，不影响导出。"""
+        self._onion = bool(on)
+        for d in self.docs:
+            d.onion = self._onion
+            d.onion_dim = self._onion_dim
+        self.canvas.update()
+        self._sync_view_actions()
+        if self._onion:
+            self.hint.setText(
+                f"洋葱皮已开：当前图层正常，其余图层压暗到 {round(self._onion_dim * 100)}%"
+                "（导出 / PSD 不受影响）")
+        else:
+            self.hint.setText("洋葱皮已关，所有图层恢复正常显示")
+
+    def set_onion_dim(self, v: float):
+        self._onion_dim = max(0.05, min(0.95, float(v)))
+        for d in self.docs:
+            d.onion_dim = self._onion_dim
+        if self._onion:
+            self.canvas.update()
 
     def _save_prefs(self):
         st = self._qsettings()
@@ -808,6 +924,8 @@ class MainWindow(QWidget):
         st.setValue("text/italic", bool(c.text_italic))
         st.setValue("canvas/simulate_pressure", bool(c.simulate_pressure))
         st.setValue("canvas/smooth_zoom", bool(c.smooth_zoom))
+        st.setValue("view/onion", bool(self._onion))
+        st.setValue("view/onion_dim", float(self._onion_dim))
         st.setValue("move/auto_select", bool(c.move_auto_select))
         st.sync()
 
@@ -862,6 +980,15 @@ class MainWindow(QWidget):
         if hasattr(self, "a_smooth"):
             self.a_smooth.setChecked(c.smooth_zoom)
 
+        # 洋葱皮：窗口级偏好，切文档时再同步给每份文档
+        self._onion = _flag("view/onion", False)
+        self._onion_dim = max(0.05, min(0.95, _num("view/onion_dim", 0.35)))
+        for d in self.docs:
+            d.onion = self._onion
+            d.onion_dim = self._onion_dim
+        self._sync_view_actions()
+        self.canvas.update()
+
         # 对称：只恢复模式 / 份数，轴心还是用当前画布的中心
         mode = st.value("sym/mode")
         if isinstance(mode, str) and mode in SYM_MODES:
@@ -892,14 +1019,15 @@ class MainWindow(QWidget):
         m_file = QMenu("文件", self)
         a_new = self._act("新建…", self.new_document, "Ctrl+N")
         a_open = self._act("打开项目…", self.open_project, "Ctrl+O")
-        a_import = self._act("打开图片…", self.import_image, "Ctrl+Shift+O")
+        a_import = self._act("打开图片为新文档…", self.import_image, "Ctrl+Shift+O")
+        a_import_layer = self._act("导入图片为图层…", self.import_image_as_layer)
         a_save = self._act("保存", self.save_project, "Ctrl+S")
         a_saveas = self._act("另存为…", self.save_project_as, "Ctrl+Shift+S")
         a_export = self._act("导出 PNG / JPG…", self.export, "Ctrl+Alt+S")
         a_psd = self._act("导出 PSD 工程（分层）…", self.export_psd_file)
         a_close = self._act("关闭当前文档", lambda: self._close_doc(self.doc_index), "Ctrl+W")
         a_quit = self._act("退出", self.close, "Ctrl+Q")
-        for w in (a_new, a_open, a_import):
+        for w in (a_new, a_open, a_import, a_import_layer):
             m_file.addAction(w)
         m_file.addSeparator()
         for w in (a_save, a_saveas, a_export, a_psd):
@@ -922,14 +1050,21 @@ class MainWindow(QWidget):
         m_edit.addAction(self.a_undo)
         m_edit.addAction(self.a_redo)
         m_edit.addSeparator()
-        # 复制 / 粘贴：快捷键同样只做展示（真绑成 QAction 会抢走文字编辑框里的
-        # Ctrl+C / Ctrl+V），实际处理在 keyPressEvent
+        # 剪切 / 复制 / 粘贴：快捷键同样只做展示（真绑成 QAction 会抢走文字
+        # 编辑框里的 Ctrl+X / Ctrl+C / Ctrl+V），实际处理在 keyPressEvent
+        a_cut = self._act("剪切", self.cut_selection)
+        a_cut.setText("剪切\tCtrl+X")
         a_copy = self._act("复制", self.copy_selection)
         a_copy.setText("复制\tCtrl+C")
         a_paste = self._act("粘贴为新图层", self.paste_clipboard)
         a_paste.setText("粘贴为新图层\tCtrl+V")
+        a_copy_layer = self._act("复制选区为新图层", self.copy_to_new_layer)
+        a_copy_layer.setText("复制选区为新图层\tCtrl+Shift+J")
+        m_edit.addAction(a_cut)
         m_edit.addAction(a_copy)
         m_edit.addAction(a_paste)
+        m_edit.addSeparator()
+        m_edit.addAction(a_copy_layer)
         m_edit.addSeparator()
         m_edit.addAction(a_tf)
         m_edit.addAction(a_clear)
@@ -939,8 +1074,11 @@ class MainWindow(QWidget):
         a_all = self._act("全选", self.select_all, "Ctrl+A")
         a_none = self._act("取消选择", self.deselect, "Ctrl+D")
         a_inv = self._act("反选", self.invert_selection, "Ctrl+Shift+I")
+        a_tolayer = self._act("把选区内容搬到当前图层", self.move_selection_to_layer)
         for w in (a_all, a_none, a_inv):
             m_sel.addAction(w)
+        m_sel.addSeparator()
+        m_sel.addAction(a_tolayer)
 
         m_layer = QMenu("图层", self)
         a_newlayer = self._act("新建图层", lambda: self.layer_action(1), "Ctrl+Shift+N")
@@ -963,24 +1101,49 @@ class MainWindow(QWidget):
         m_layer.addAction(a_ungroup)
 
         m_view = QMenu("视图", self)
-        a_fit = self._act("适应窗口", self.fit_view, "Ctrl+0")
-        a_100 = self._act("实际像素 100%", lambda: self.canvas.set_zoom(1.0), "Ctrl+1")
-        a_zin = self._act("放大", lambda: self.canvas.zoom_step(True), "Ctrl+=")
-        a_zout = self._act("缩小", lambda: self.canvas.zoom_step(False), "Ctrl+-")
+        # 这四个缩放是「跟随最后点击的窗口」的：点过参考图窗口就作用在参考图上，
+        # 点回画布又切回画布。所以用 ApplicationShortcut（参考图有焦点时也收得到），
+        # 具体作用在谁身上由 _zoom_target 决定。
+        a_fit = self._act("适应窗口", self.zoom_fit, "Ctrl+0")
+        a_100 = self._act("实际像素 100%", self.zoom_100, "Ctrl+1")
+        a_zin = self._act("放大", lambda: self.zoom_step(True), "Ctrl+=")
+        a_zout = self._act("缩小", lambda: self.zoom_step(False), "Ctrl+-")
+        for a in (a_fit, a_100, a_zin, a_zout):
+            a.setShortcutContext(Qt.ApplicationShortcut)
         for w in (a_fit, a_100, a_zin, a_zout):
             m_view.addAction(w)
         m_view.addSeparator()
         # 放大时的显示方式：默认「像素清晰」（关掉平滑），描线看边缘用这个
-        self.a_smooth = QAction("放大时平滑显示", self)
+        self.a_smooth = QAction("放大时始终平滑显示", self)
         self.a_smooth.setCheckable(True)
         self.a_smooth.setChecked(False)
-        self.a_smooth.setToolTip("关（默认）：放大后每个像素是清晰的方块，硬笔边缘真实\n"
-                                 "开：放大后做平滑插值，看着柔但边缘会糊")
+        self.a_smooth.setToolTip("关（默认）：400% 以下平滑插值，再往上切成像素方块\n"
+                                 "开：任何倍率都平滑，边缘不会出现阶梯（看细节会略糊）")
         self.a_smooth.toggled.connect(self.set_smooth_zoom)
         m_view.addAction(self.a_smooth)
+
+        # 洋葱皮：聚焦当前图层
+        m_view.addSeparator()
+        self.a_onion = self._act("洋葱皮（聚焦当前图层）", self.toggle_onion,
+                                 "Ctrl+Shift+K", checkable=True)
+        m_view.addAction(self.a_onion)
+
+        # 参考图窗口（临摹用）
+        self.a_ref = self._act("参考图窗口…", self.open_reference, "Ctrl+Shift+R")
+        m_view.addAction(self.a_ref)
+
         # 工作区：几块面板都能拖，拖乱了用这一项一键还原
+        m_view.addSeparator()
         a_reset = self._act("复位工作区", self.reset_workspace)
         m_view.addAction(a_reset)
+
+        m_filter = QMenu("滤镜", self)
+        for _key, _label, _fn, _p in filters.FILTERS:
+            # triggered 会塞一个 checked=False 进来，必须用 checked 占住第一个位置，
+            # 否则它会把 _k 的默认值覆盖掉 —— 之前「所有滤镜都没效果、换一个也不变」
+            # 就是栽在这：每次都在调 apply_filter(False)。
+            m_filter.addAction(
+                self._act(_label, lambda checked=False, _k=_key: self.open_filter(_k)))
 
         m_help = QMenu("帮助", self)
         a_keys = self._act("快捷键一览", self.show_shortcuts)
@@ -991,7 +1154,7 @@ class MainWindow(QWidget):
         m_help.addAction(a_support)
         m_help.addAction(a_about)
 
-        for m in (m_file, m_edit, m_sel, m_layer, m_view, m_help):
+        for m in (m_file, m_edit, m_sel, m_layer, m_view, m_filter, m_help):
             self.menu_holder.addWidget(self._menu_button(m))
         # 「赞助」不是下拉菜单，点一下就开：入口要显眼，但不该占用户两下手
         self.support_btn = self._menu_button(None, "赞助", self.show_sponsor)
@@ -1000,7 +1163,7 @@ class MainWindow(QWidget):
         brand = QLabel(f"{APP_NAME} · 绘画版")
         brand.setStyleSheet(f"color: {C.TEXT_FAINT}; font-size: 10px; padding-right: 4px;")
         self.menu_holder.addWidget(brand)
-        self.menus = (m_file, m_edit, m_sel, m_layer, m_view, m_help)
+        self.menus = (m_file, m_edit, m_sel, m_layer, m_view, m_filter, m_help)
 
         # 压感的两个开关给纯键盘快捷键（不进菜单，挂在窗口上就能生效）
         self.a_psize = self._act("压感控制大小（开 / 关）",
@@ -1036,6 +1199,44 @@ class MainWindow(QWidget):
         return b
 
     # ------------------------------------------------------------ 选项栏
+    def _build_sel_tools(self) -> QWidget:
+        """选项栏右侧常驻：剪切 / 复制 / 复制为新图层。
+
+        这三个以前只在「编辑」菜单里，用户反馈「怎么没有可视化按钮」。
+        没有选区时它们作用于整层，所以不存在「点了没反应」的空转状态。
+        """
+        box = QWidget()
+        lay = QHBoxLayout(box)
+        lay.setContentsMargins(0, 0, 4, 0)
+        lay.setSpacing(3)
+
+        def mk(text, tip, slot, width):
+            b = QToolButton(box)
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setFixedHeight(22)
+            b.setFixedWidth(width)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setStyleSheet(
+                "QToolButton { border: 1px solid transparent; border-radius: 3px;"
+                f" background: transparent; color: {C.TEXT_DIM}; font-size: 11px;"
+                " padding: 0 6px; }"
+                f"QToolButton:hover {{ background: {C.HOVER}; color: {C.TEXT}; }}"
+                f"QToolButton:pressed {{ background: {C.PRESSED}; }}")
+            b.clicked.connect(lambda _=False: slot())
+            lay.addWidget(b)
+            return b
+
+        mk("剪切", "把选区（没有选区就是整层）剪到新图层，可直接拖动　Ctrl+X",
+           self.cut_selection, 44)
+        mk("复制", "复制到新图层、保留原内容，可直接拖动　Ctrl+C",
+           self.copy_selection, 44)
+        mk("复制为新层", "复制到新图层、保留原内容，不切工具　Ctrl+Shift+J",
+           self.copy_to_new_layer, 80)
+        self.sel_tools_box = box
+        box.setVisible(bool(self.doc.has_selection()))
+        return box
+
     def _build_options(self):
         while self.options_layout.count():
             item = self.options_layout.takeAt(0)
@@ -1049,6 +1250,10 @@ class MainWindow(QWidget):
         # 选项栏重建后旧控件就没了，引用必须一起清掉，否则 _sync_sym_bar 会摸到野指针
         self.sym_combo = None
         self.sym_lbl = None
+        # 滤镜预览期间，选项栏整个换成滤镜控件（滑杆 + 应用 / 取消）
+        if self._filter_state is not None:
+            self._build_filter_options()
+            return
         self.text_color_btn = None
         self.text_recent = None
 
@@ -1071,7 +1276,6 @@ class MainWindow(QWidget):
                 b.setFixedHeight(24)
                 b.clicked.connect(lambda _=False, h=horiz: self.canvas.tf_flip(h))
                 self.options_layout.addWidget(b)
-
 
             self.options_layout.addStretch(1)
             tip = QLabel("框内拖动移动 · 拖角缩放 · 框外旋转 · 双击/Enter 应用 · Esc 取消")
@@ -1806,6 +2010,7 @@ class MainWindow(QWidget):
         self.rail.toolChanged.connect(self._on_tool)
         self.rail.colorsSwapped.connect(self.swap_colors)
         self.rail.zoomStep.connect(self._on_rail_zoom)
+        self.rail.referenceRequested.connect(self.open_reference)
         self.canvas.zoomChanged.connect(self._on_zoom)
         self.canvas.pressureChanged.connect(self._on_pressure)
         self.canvas.cursorMoved.connect(self._on_cursor)
@@ -1827,6 +2032,13 @@ class MainWindow(QWidget):
         self.canvas.blocked.connect(lambda msg: self.hint.setText(msg))
         self.canvas.transformChanged.connect(self._on_transform_changed)
         self.canvas.canvasTouched.connect(self._on_canvas_touched)
+        self.canvas.selectionMade.connect(self._on_selection_made)
+        self.canvas.selectionChanged.connect(self._sync_sel_tools)
+        self.canvas.filter_guard = self._filter_guard
+        self.canvas.filter_key = self._filter_key
+        # 在画布上落笔/点击 = 把缩放快捷键切回画布
+        self.canvas.canvasTouched.connect(
+            lambda: setattr(self, "_zoom_target", "canvas"))
         self.canvas.filesDropped.connect(self._on_files_dropped)
         self.sym_panel.changed.connect(self._on_symmetry_changed)
         self.sym_panel.pickRequested.connect(self._on_sym_pick)
@@ -1835,6 +2047,7 @@ class MainWindow(QWidget):
         self.canvas.textCommitted.connect(self._on_text_committed)
         self.canvas.textEditing.connect(self._on_text_editing)
         self.layers_panel.textEditRequested.connect(self.edit_text)
+        self.layers_panel.onionToggled.connect(self.toggle_onion)
         self.strip.tabActivated.connect(self._switch_doc)
         self.strip.tabClosed.connect(self._close_doc)
         self.strip.newRequested.connect(self.new_document)
@@ -1849,7 +2062,19 @@ class MainWindow(QWidget):
         self.canvas.update()
         QTimer.singleShot(0, self.canvas.warm_brush_cache)
 
+    # 只有这些工具才算「要动内容」，切到它们才值得问一句要不要落地滤镜。
+    # 抓手 / 吸管 / 选区这些只是看和量，弹框纯属打扰。
+    _CONTENT_TOOLS = ("brush", "eraser", "smudge", "bucket", "text")
+
     def _on_tool(self, key):
+        need = (self._filter_state is not None
+                and (key in self._CONTENT_TOOLS or key in SHAPE_TOOLS))
+        res = self._filter_guard() if need else "none"
+        if res == "stay":
+            self.rail.blockSignals(True)      # 用户要继续调滤镜：工具栏退回原样
+            self.rail.select(self.current_tool)
+            self.rail.blockSignals(False)
+            return
         self.current_tool = key
         self.canvas.set_tool(key)
         self._bind_brush_panel(key)
@@ -1922,9 +2147,70 @@ class MainWindow(QWidget):
         else:
             self.canvas.setFocus()
 
+    def _on_selection_made(self):
+        """刚圈完选区：记下它是在哪一层上圈出来的。
+
+        切图层时**不会自动搬**内容 —— 那样你只是想看一眼别的层，画就被搬走了。
+        要搬的时候用「把选区内容搬到当前图层」。
+        """
+        self._sel_layer = self.doc.layer
+
+    def move_selection_to_layer(self):
+        """把选区里的像素从「圈选区时那层」搬到当前图层，位置不变。
+
+        典型用法：在 A 层圈一块 → 切到 B 层 → 这一项，内容就搬到 B 了。
+        """
+        self.canvas.commit_float()
+        doc = self.doc
+        dst = doc.layer
+        src = self._sel_layer
+        if not doc.has_selection():
+            self.hint.setText("没有选区：先圈一块再搬")
+            return
+        if src is None or src not in doc.layers:
+            self.hint.setText("不知道这块选区是从哪层圈出来的，重新圈一次再搬")
+            return
+        if src is dst:
+            self.hint.setText("选区内容已经在当前图层了")
+            return
+        if doc.is_locked(src) or doc.is_locked(dst):
+            self.hint.setText("源图层或目标图层已锁定，先解锁")
+            return
+        got = doc.extract_selection_pixels(src)
+        if got is None:
+            self.hint.setText("选区里没有像素，没东西可搬")
+            return
+        img, pos = got
+        sel = QPainterPath(doc.selection)
+
+        def apply():
+            r = sel.boundingRect().toAlignedRect().intersected(
+                QRect(0, 0, src.image.width(), src.image.height()))
+            if not r.isEmpty():
+                p1 = QPainter(src.image)
+                p1.setCompositionMode(QPainter.CompositionMode_Clear)
+                p1.setClipPath(sel)
+                p1.fillRect(r, Qt.transparent)
+                p1.end()
+                src.touch()
+            p2 = QPainter(dst.image)
+            p2.drawImage(pos, img)
+            p2.end()
+            dst.has_content = True
+            dst.touch()
+            doc.recompose()
+            return True
+
+        if self.run_struct("选区内容搬到当前图层", apply):
+            self._sel_layer = dst
+            self.hint.setText(f"已把选区内容从「{src.name}」搬到「{dst.name}」")
+
     def _sync_layer_selection(self):
         sel = sorted(getattr(self.layers_panel, "selected", set()))
         self.canvas.layer_selection = sel
+        # 多选/取消选中会改变洋葱皮里「哪些层保持正常」，画面要跟着变
+        if self._onion:
+            self.canvas.update()
 
     def _on_layer_picked(self, index, mods=0):
         # 移动工具自动选中：连修饰键一起交给图层面板，Ctrl 加选 / Shift 区间选
@@ -1941,8 +2227,12 @@ class MainWindow(QWidget):
             self.hint.setText(self.hint.text() + f"（「{skipped.name}」已锁定，略过）")
 
     def _on_active_layer(self):
-        # 只是切换选中图层，不需要重绘画布；刷新标题与图层数即可
         self._refresh_title()
+        # 洋葱皮是「按当前图层现合成」的：切层必须重绘画布，否则画面还停在
+        # 上一层的样子，看起来就是「点了没反应」—— 只在别的操作顺带触发重绘
+        # 时才生效，所以表现为「有时候有反应有时候没有」。
+        if self._onion:
+            self.canvas.update()
 
     def _on_layers_changed(self):
         # 只重绘画布和标题；这里绝不能 refresh 图层列表，
@@ -2053,6 +2343,10 @@ class MainWindow(QWidget):
         self.canvas.set_document(doc, fit=False)
         self.canvas.set_tool(self.current_tool)
         self.layers_panel.set_document(doc)
+        # 洋葱皮按窗口的设置同步给这份文档（它是看图的习惯，不是文档属性）
+        doc.onion = self._onion
+        doc.onion_dim = self._onion_dim
+        self._sync_view_actions()
         self._restore_view(doc, fit=fit)
         if getattr(self, "sym_panel", None) is not None:
             self.sym_panel.sync()
@@ -2517,6 +2811,7 @@ class MainWindow(QWidget):
 
     def paste_clipboard(self):
         """粘贴：贴成新图层（原位置优先，尺寸不同就居中）。"""
+        self.canvas.commit_float()       # 先让上一步复制落地，别叠着两件事
         doc = self.doc
         if len(doc.layers) >= MAX_LAYERS:
             dialogs.tell(self, "图层已满", f"当前版本上限 {MAX_LAYERS} 个图层。")
@@ -2562,7 +2857,119 @@ class MainWindow(QWidget):
                 f"已粘贴为「{name}」（{img.width()}×{img.height()}）"
                 "　移动工具可以接着摆位置")
 
+    # ------------------------------------------------------------ 选区 → 图层
+    def _new_layer_name(self, base: str) -> str:
+        existing = {l.name for l in self.doc.layers}
+        n = 1
+        while f"{base} {n}" in existing:
+            n += 1
+        return f"{base} {n}"
+
+    def _grab_pixels(self, action: str):
+        """取出要操作的像素：**有选区取选区，没有就取整层**。
+
+        返回 (layer, img, pos, what)；不满足条件返回 None。
+        没有选区也照样能干活，是用户明确要的 —— 以前点一下只弹句提示，
+        看着就是「按了没反应」。
+        """
+        doc = self.doc
+        layer = doc.layer
+        if layer is None:
+            return None
+        if doc.is_locked(layer):
+            self.hint.setText(f"「{layer.name}」已锁定，先解锁再{action}")
+            return None
+        if doc.has_selection():
+            got = doc.extract_selection_pixels(layer)
+            if got is None:
+                self.hint.setText("选区是空的，没有可拿的像素")
+                return None
+            img, pos = got
+            return layer, img, pos, "选区"
+        return layer, layer.image.copy(), QPoint(0, 0), "整层"
+
+    def _layer_from_pixels(self, img, pos, base: str, clear_first=False) -> str:
+        """把一块像素做成新图层（放在当前层上方）。返回图层名，失败返回空串。"""
+        doc = self.doc
+        if len(doc.layers) >= MAX_LAYERS:
+            dialogs.tell(self, "图层已满", f"当前版本上限 {MAX_LAYERS} 个图层。")
+            return ""
+        name = self._new_layer_name(base)
+
+        def apply():
+            if clear_first:
+                # 先把源层清空（有选区清选区，没选区清整层）。
+                # 它和 add_layer 都落在同一个 StructEdit 快照区间里，
+                # 所以 Ctrl+Z 一次就能把像素和图层结构一起还原。
+                doc.clear_area()
+            nl = doc.add_layer(name=name, above=True, select=True)
+            p = QPainter(nl.image)
+            p.drawImage(pos, img)
+            p.end()
+            nl.has_content = True
+            nl.touch()
+            doc.recompose()
+            return True
+
+        return name if self.run_struct(f"{base}到新图层", apply) else ""
+
+    def copy_selection(self):
+        """复制：在**当前图层上复制一份**，直接拖着摆位置。
+
+        - 不新建图层（要新图层用「复制为新层」Ctrl+Shift+J）
+        - 不走「存剪贴板再粘贴」那两步，复制完就能拖
+        - 落地前什么都不写进图层，所以 Esc 取消是干净的
+        剪贴板照写一份，跨文档 / 贴到别的软件仍然能用。
+        """
+        doc = self.doc
+        got = self._grab_pixels("复制")
+        if got is None:
+            return
+        layer, img, pos, what = got
+        PASTE_BUF.update(image=img, pos=pos, size=(doc.w, doc.h), title=doc.title)
+        QApplication.clipboard().setImage(img)
+        if self.canvas.begin_float(img, pos, layer):
+            self.hint.setText(
+                f"已复制{what}到「{layer.name}」　拖动摆位置 · 点别处或 Enter 落地 · Esc 取消")
+
+    def cut_selection(self):
+        """剪切：把内容从原层**拿走**，放进新图层（原位置），可马上拖动。"""
+        self.canvas.commit_float()
+        doc = self.doc
+        got = self._grab_pixels("剪切")
+        if got is None:
+            return
+        layer, img, pos, what = got
+        PASTE_BUF.update(image=img, pos=pos, size=(doc.w, doc.h), title=doc.title)
+        QApplication.clipboard().setImage(img)
+        name = self._layer_from_pixels(img, pos, "剪切", clear_first=True)
+        if name:
+            self.rail.select("move")
+            self.hint.setText(f"已把{what}剪到「{name}」　原层已清空，直接拖动就能摆位置")
+
+    def copy_to_new_layer(self):
+        """复制为新图层：保留原内容、新建一层，**不切工具**（原地继续干活）。"""
+        self.canvas.commit_float()
+        got = self._grab_pixels("复制为新图层")
+        if got is None:
+            return
+        layer, img, pos, what = got
+        name = self._layer_from_pixels(img, pos, "选区")
+        if name:
+            self.hint.setText(
+                f"已把{what}复制为「{name}」（{img.width()}×{img.height()}，位置不变）")
+
     def undo(self):
+        if self._filter_state is not None:
+            # 预览只是挂在图层上的临时效果，撤销栈里没有它。
+            # 直接 doc.undo() 会去撤上一条编辑，而预览还留在画面上，看着就是「撤不回去」。
+            self._filter_cancel()
+            self.hint.setText("已取消滤镜预览（预览本身不进撤销栈，要撤应用后的效果请再按一次）")
+            return
+        if self.canvas.has_float():
+            self.canvas.cancel_float()
+            self.hint.setText("已取消这次复制（还没写进图层，不需要还原像素）")
+            return
         if self.canvas.has_transform():
             # 自由变换里：一次退一步（回到上一次调整之前），退到头了才取消整个变换
             if self.canvas.tf_step_back():
@@ -2577,10 +2984,277 @@ class MainWindow(QWidget):
             self._refresh_title()
 
     def redo(self):
+        if self._filter_state is not None:
+            self._filter_cancel()
+            self.hint.setText("已取消滤镜预览")
+            return
         if self.doc.redo():
             self.layers_panel.refresh()
             self.canvas.sync_selection_ants()
             self._refresh_title()
+
+    # ------------------------------------------------------------ 导入图片
+    def import_image_as_layer(self):
+        """把一张图片导进当前画布，变成一个新图层（同尺寸按原位，否则居中）。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入图片为图层", "",
+            "图片 (*.png *.jpg *.jpeg *.bmp *.webp *.gif);;所有文件 (*)")
+        if not path:
+            return
+        img = QImage(path)
+        if img.isNull():
+            dialogs.tell(self, "打不开", "这个文件不是有效的图片。")
+            return
+        doc = self.doc
+        if len(doc.layers) >= MAX_LAYERS:
+            dialogs.tell(self, "图层已满", "当前版本上限 %d 个图层。" % MAX_LAYERS)
+            return
+        name = self._new_layer_name("图片")
+        same = (img.width() == doc.w and img.height() == doc.h)
+        x = 0 if same else (doc.w - img.width()) // 2
+        y = 0 if same else (doc.h - img.height()) // 2
+
+        def apply():
+            nl = doc.add_layer(name=name, above=True, select=True)
+            p = QPainter(nl.image)
+            p.drawImage(x, y, img)
+            p.end()
+            nl.has_content = True
+            nl.touch()
+            doc.recompose()
+            return True
+
+        if self.run_struct("导入图片", apply):
+            self.hint.setText(
+                "已导入「%s」（%d×%d）%s" % (name, img.width(), img.height(),
+                                          "，按原位放置" if same else "，居中放置"))
+
+    # ------------------------------------------------------------ 滤镜（预览 → 应用）
+    def _filter_target(self, doc, layer):
+        """要处理的矩形 + 是不是只处理选区。"""
+        if doc.has_selection():
+            r = doc.selection.boundingRect().toAlignedRect().intersected(
+                QRect(0, 0, layer.image.width(), layer.image.height()))
+            return r, True
+        return QRect(0, 0, layer.image.width(), layer.image.height()), False
+
+    def open_filter(self, key: str):
+        """打开滤镜预览：画布上直接看到效果，选项栏给滑杆 + 醒目的「应用」。
+
+        预览期间**不改撤销栈**，点「应用」才真正写进图层 —— 所以「取消」是干净的。
+        """
+        key = filters.resolve(key)
+        if key is None:
+            self.hint.setText("未知滤镜")
+            return
+        self.canvas.commit_float()
+        doc = self.doc
+        layer = doc.layer
+        if layer is None:
+            return
+        if doc.is_locked(layer):
+            self.hint.setText("「%s」已锁定，先解锁再用滤镜" % layer.name)
+            return
+        if self._filter_state is not None:
+            # 已经在预览：**换滤镜不落地**，只换参数，仍基于同一份原始图像重新预览。
+            # 以前这里会自动 _filter_apply()，用户根本没点「应用」就被写进图层了，
+            # 于是多个滤镜层层叠加，越看越怪。
+            st = self._filter_state
+            if st["key"] == key:
+                return                       # 同一个滤镜，别把参数重置了
+            st["key"] = key
+            st["params"] = filters.default_params(key)
+            self._filter_refresh()
+            self._build_options()
+            self.hint.setText(
+                "滤镜「%s」预览中：拖滑杆看效果，点「应用」落地，Esc / 取消 放弃"
+                % filters.label_for(key))
+            return
+        r, in_sel = self._filter_target(doc, layer)
+        if r.isEmpty():
+            self.hint.setText("选区是空的，没有可处理的像素")
+            return
+        # base 是「这次预览的原始底图」，换滤镜时一直用它，保证不叠加
+        self._filter_state = {
+            "key": key,
+            "params": filters.default_params(key),
+            "base": {
+                "layer": layer,
+                "rect": r,
+                "in_sel": in_sel,
+                "before": layer.image.copy(),
+            },
+        }
+        self._filter_refresh()
+        self._build_options()
+        self.hint.setText(
+            "滤镜「%s」预览中：拖滑杆看效果，点「应用」落地，Esc / 取消 放弃"
+            % filters.label_for(key))
+
+    def _filter_param(self, name: str, value: int):
+        st = self._filter_state
+        if st is None:
+            return
+        st["params"][name] = value
+        # 拖滑杆时合并重算：每 80ms 最多算一次，不然大画布上会卡手
+        if not self._filter_timer.isActive():
+            self._filter_timer.start()
+
+    def _filter_refresh(self, force_full: bool = False):
+        """按当前参数重算预览，直接写进图层图像（合成 / 图层顺序 / 洋葱皮都对）。"""
+        st = self._filter_state
+        if st is None:
+            return
+        base = st["base"]
+        layer, r, in_sel = base["layer"], base["rect"], base["in_sel"]
+        # 处理区域往外扩一圈再裁回来：模糊 / 像素化需要「选区外的邻居像素」，
+        # 直接拿选区大小去算，边界会被边缘延拓污染，出现一圈明显的接缝方框。
+        full = QRect(0, 0, layer.image.width(), layer.image.height())
+        pad = 48
+        big = r.adjusted(-pad, -pad, pad, pad).intersected(full)
+        src = base["before"].copy(big)
+        # 注意：**不要**为了快而「降采样算完再放大回来」。
+        # 放大回来的采样网格有半像素偏移，原图那圈半透明边就会在某一侧露出
+        # 1~2px 的原始颜色（放大到 200%+ 看得非常明显）。
+        # 宁可慢一点，靠 80ms 防抖控制频率。
+        try:
+            out = filters.apply_filter(st["key"], src, **st["params"])
+        except Exception as exc:                 # 滤镜出错不该把画布弄坏
+            self.hint.setText("滤镜失败：%s" % exc)
+            return
+        if out is None or out.isNull() or out.size() != src.size():
+            return
+        out = out.copy(r.translated(-big.topLeft()))     # 裁回目标区域
+        img = base["before"].copy()
+        p = QPainter(img)
+        # 必须用 Source 直接替换：默认的 SourceOver 会把滤镜结果**叠**在原图上，
+        # 滤镜输出带半透明边（线条抗锯齿处），原来的颜色就从下面透出来 ——
+        # 放大后就是那圈「边缘还是原色」的粉边。黑白尤其明显。
+        p.setCompositionMode(QPainter.CompositionMode_Source)
+        if in_sel:
+            p.setClipPath(self.doc.selection)
+        p.drawImage(r.topLeft(), out)
+        p.end()
+        layer.image = img
+        layer.touch()
+        self.doc.recompose()
+        self.canvas.update()
+
+    def _filter_apply(self):
+        st = self._filter_state
+        if st is None:
+            return
+        self._filter_refresh(force_full=True)     # 落地前按全分辨率重算，避免存下半分辨率的预览
+        self._filter_state = None
+        self._filter_timer.stop()
+        base = st["base"]
+        layer, r = base["layer"], base["rect"]
+        before = base["before"].copy(r)
+        after = layer.image.copy(r)
+        layer.has_content = True
+        self.doc.push(PixelEdit(layer, r, before, after))
+        self._build_options()
+        self._sync_history()
+        self.hint.setText("已应用「%s」　Ctrl+Z 可撤销" % filters.label_for(st["key"]))
+
+    def _filter_cancel(self):
+        st = self._filter_state
+        if st is None:
+            return
+        self._filter_state = None
+        self._filter_timer.stop()
+        base = st["base"]
+        base["layer"].image = base["before"]   # 预览直接改的是图层图，还原就干净了
+        base["layer"].touch()
+        self.doc.recompose()
+        self.canvas.update()
+        self._build_options()
+        self.hint.setText("已放弃滤镜")
+
+    def _filter_guard(self) -> str:
+        """预览中用户想干别的：先问要不要应用。
+
+        返回三态：
+          "none"  没有预览，调用方照常干活
+          "done"  预览已处理完（应用 / 放弃），**这次操作要吞掉**
+          "stay"  用户选了「继续调整」，这次操作也要吞掉
+
+        以前只返回 True/False，`pointer_down` 在对话框关掉后还会继续往下跑，
+        于是「点一下 → 弹框 → 关掉框 → 凭空落了一笔」。
+        """
+        if self._filter_state is None:
+            return "none"
+        key = self._filter_state["key"]
+        ans = dialogs.ask(
+            self, "滤镜还没应用",
+            "「%s」现在只是预览，还没写进图层。\n要现在应用吗？" % filters.label_for(key),
+            [("apply", "应用", "primary"),
+             ("drop", "放弃", "danger"),
+             ("stay", "继续调整", None)],
+            default="apply")
+        if ans == "apply":
+            self._filter_apply()
+            return "done"
+        if ans == "drop":
+            self._filter_cancel()
+            return "done"
+        return "stay"
+
+    def _sync_sel_tools(self):
+        """没有选区就不显示「剪切 / 复制 / 复制为新层」——用户反馈平时碍眼。"""
+        box = getattr(self, "sel_tools_box", None)
+        if box is not None:
+            box.setVisible(bool(self.doc.has_selection()))
+
+    def _filter_key(self, key) -> bool:
+        """滤镜预览期间的按键：Esc 放弃、Enter 应用。"""
+        if self._filter_state is None:
+            return False
+        if key == Qt.Key_Escape:
+            self._filter_cancel()
+            return True
+        if key in (Qt.Key_Return, Qt.Key_Enter):
+            self._filter_apply()
+            return True
+        return False
+
+    def _build_filter_options(self):
+        """预览期间的选项栏：参数滑杆 + 取消 + 醒目的应用按钮。"""
+        st = self._filter_state
+        cap = QLabel("滤镜 · %s" % filters.label_for(st["key"]))
+        f = QFont(cap.font())
+        f.setBold(True)
+        f.setPointSizeF(9.2)
+        cap.setFont(f)
+        cap.setStyleSheet("color: %s; padding-right: 6px;" % C.ACCENT)
+        self.options_layout.addWidget(cap)
+
+        for name, label, lo, hi, default in filters.params_for(st["key"]):
+            cur = int(st["params"].get(name, default))
+            self._opt_slider(label, lo, hi, cur, "",
+                             lambda v, n=name: self._filter_param(n, v), width=150)
+
+        self.options_layout.addStretch(1)
+        tip = QLabel("拖滑杆看预览 · 应用后才写进图层")
+        tip.setStyleSheet("color: %s; font-size: 10px;" % C.TEXT_FAINT)
+        self.options_layout.addWidget(tip)
+
+        b_cancel = QPushButton("取消")
+        b_cancel.setFixedHeight(24)
+        b_cancel.setToolTip("放弃这次滤镜，图层恢复原样（Esc 同效）")
+        b_cancel.clicked.connect(self._filter_cancel)
+        self.options_layout.addWidget(b_cancel)
+
+        b_ok = QPushButton("✔ 应用")
+        b_ok.setFixedHeight(26)
+        b_ok.setToolTip("把预览结果写进图层（Enter 同效，可 Ctrl+Z 撤销）")
+        b_ok.setStyleSheet(
+            "QPushButton { background: %s; color: #FFFFFF; border: none;"
+            " border-radius: 4px; padding: 0 18px; font-size: 12px;"
+            " font-weight: bold; }"
+            "QPushButton:hover { background: #4A9CF5; }" % C.ACCENT)
+        b_ok.clicked.connect(self._filter_apply)
+        self.options_layout.addWidget(b_ok)
 
     def clear_area(self):
         if self.doc.layer is not None and self.doc.is_locked(self.doc.layer):
@@ -2606,15 +3280,20 @@ class MainWindow(QWidget):
 
     def select_all(self):
         self.doc.select_all()
-        self.canvas.update()
+        self.canvas.sync_selection_ants()
 
     def deselect(self):
+        """取消选择。浮动副本也算「正在选中的东西」，一起取消掉 ——
+        否则清完选区，那块虚线框还留在画布上，看着就像「没取消掉」。"""
+        if self.canvas.has_float():
+            self.canvas.cancel_float()
         self.doc.clear_selection()
+        self.canvas.sync_selection_ants()      # 顺带把蚂蚁线计时器停掉
         self.canvas.update()
 
     def invert_selection(self):
         self.doc.invert_selection()
-        self.canvas.update()
+        self.canvas.sync_selection_ants()
 
     # ------------------------------------------------------------ 图层
     def _panel_focused(self) -> bool:
@@ -2934,11 +3613,26 @@ class MainWindow(QWidget):
         # 文字编辑框里的 Ctrl+C / Ctrl+V 是它自己的复制粘贴，不能被抢。
         if not self._typing() and (e.modifiers() & Qt.ControlModifier):
             k = e.key()
-            if k == Qt.Key_C and not (e.modifiers() & Qt.ShiftModifier):
+            shift = bool(e.modifiers() & Qt.ShiftModifier)
+            if k == Qt.Key_C and not shift:
                 self.copy_selection()
                 return
-            if k == Qt.Key_V and not (e.modifiers() & Qt.ShiftModifier):
+            if k == Qt.Key_X and not shift:
+                self.cut_selection()
+                return
+            if k == Qt.Key_J and shift:
+                self.copy_to_new_layer()
+                return
+            if k == Qt.Key_V and not shift:
                 self.paste_clipboard()
+                return
+            # 撤销 / 重做也走这条显式分支：光靠 QAction 的快捷键在
+            # 画布有焦点时会被别的按键处理抢掉（实测 Ctrl+Z 会变成切工具）
+            if k == Qt.Key_Z and not shift:
+                self.undo()
+                return
+            if (k == Qt.Key_Z and shift) or k == Qt.Key_Y:
+                self.redo()
                 return
         if self.canvas.has_transform() and not self._typing():
             if e.key() in (Qt.Key_Return, Qt.Key_Enter):
@@ -2993,6 +3687,11 @@ class MainWindow(QWidget):
 
     def closeEvent(self, e):
         self._save_window_state()
+        if self._refwin is not None:
+            try:
+                self._refwin._save()          # 参考图窗口的位置 / 透明度
+            except Exception:
+                pass
         self._save_tool_brushes()             # 橡皮 / 涂抹的笔径、硬度
         self._save_prefs()                    # 前景/背景色、当前工具、对称…
         try:
